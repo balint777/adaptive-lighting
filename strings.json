@@ -1,0 +1,11 @@
+{
+    "title": "Adaptive Lighting",
+    "config": {
+        "step": {
+            "user": {
+            "title": "Adaptive Lighting",
+            "description": "Automatically adapt color temperature and brightness for all capable lights."
+            }
+        }
+    }
+}
