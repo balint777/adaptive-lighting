@@ -7,6 +7,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.const import ATTR_SUPPORTED_FEATURES
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers import entity_registry, area_registry
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_ELEVATION,
@@ -130,8 +132,8 @@ class AdaptiveController:
     def _discover_targets(self) -> Dict[str, str]:
         # Return mapping entity_id -> mode ("ct" or "rgb")
         out: Dict[str, str] = {}
-        ent_reg = self.hass.helpers.entity_registry.async_get(self.hass)
-        area_reg = self.hass.helpers.area_registry.async_get(self.hass)
+        ent_reg = entity_registry.async_get(self.hass)
+        area_reg = area_registry.async_get(self.hass)
 
         def allowed(ent_id: str) -> bool:
             if self.settings.include_entities and ent_id not in self.settings.include_entities:
@@ -178,7 +180,7 @@ class AdaptiveController:
 
     def _compute_targets(self):
         # Sleep window override
-        now = self.hass.helpers.event.dt_util.now().time()
+        now = dt_util.now().time()
         if in_window(now, parse_time_str(self.settings.night_start), parse_time_str(self.settings.night_end)):
             return (self.settings.sleep_b, self.settings.sleep_k)
 
