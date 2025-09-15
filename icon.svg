@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="sunGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F9D976"/>
+      <stop offset="50%" stop-color="#F39C6B"/>
+      <stop offset="100%" stop-color="#A889E6"/>
+    </linearGradient>
+    <mask id="sunMask">
+      <rect width="256" height="256" fill="black"/>
+      <g transform="translate(128,128)" fill="white">
+        <!-- Rays -->
+        <rect x="-10" y="-124" width="20" height="42" rx="10"/>
+        <rect x="-10" y="82"  width="20" height="42" rx="10"/>
+        <rect x="-124" y="-10" width="42" height="20" rx="10"/>
+        <rect x="82"  y="-10" width="42" height="20" rx="10"/>
+
+        <g transform="rotate(45)">
+          <rect x="-10" y="-124" width="20" height="42" rx="10"/>
+          <rect x="-10" y="82"  width="20" height="42" rx="10"/>
+        </g>
+        <g transform="rotate(-45)">
+          <rect x="-10" y="-124" width="20" height="42" rx="10"/>
+          <rect x="-10" y="82"  width="20" height="42" rx="10"/>
+        </g>
+
+        <!-- Sun disk -->
+        <circle r="60"/>
+      </g>
+    </mask>
+  </defs>
+
+  <!-- Apply gradient through mask -->
+  <rect width="256" height="256" fill="url(#sunGrad)" mask="url(#sunMask)"/>
+</svg>

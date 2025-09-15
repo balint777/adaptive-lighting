@@ -70,7 +70,9 @@ class AdaptiveController:
         self.hass = hass
         self.settings = settings
         self._unsub = None
-        self._manual_hold_until: Dict[str, float] = {}
+        self._manual_hold_entities: Set[str] = set()  # Entities with manual adjustments
+        self._last_turn_on: Dict[str, float] = {}  # Track when entities were turned on
+        self._last_automation_change: Dict[str, float] = {}  # Track our own changes
         self._enabled = True
 
     def set_enabled(self, enabled: bool) -> None:
@@ -111,15 +113,33 @@ class AdaptiveController:
             if self.settings.only_when_on and state.state != "on":
                 continue
 
-            # Manual hold check: if user touched the light (brightness/ct) recently, skip
+            # Track when light was turned on
+            if state.state == "on":
+                state_changed = state.last_changed.timestamp() if state.last_changed else 0
+                last_turn_on = self._last_turn_on.get(ent_id, 0)
+                
+                # If this is a new turn-on event, clear manual hold and update turn-on time
+                if state_changed > last_turn_on:
+                    self._last_turn_on[ent_id] = state_changed
+                    # Clear manual hold when light is turned on
+                    self._manual_hold_entities.discard(ent_id)
+
+            # Manual hold check: detect if user manually adjusted the light
             last_changed = state.last_changed.timestamp() if state.last_changed else 0
-            hold_until = self._manual_hold_until.get(ent_id, 0)
-            if last_changed and (last_changed > hold_until):
-                # set new hold window
-                self._manual_hold_until[ent_id] = last_changed + self.settings.manual_hold_s
+            last_turn_on = self._last_turn_on.get(ent_id, 0)
+            last_automation = self._last_automation_change.get(ent_id, 0)
+            
+            # If the light changed after turn-on and it wasn't from our automation, it's manual
+            if (last_changed > last_turn_on and 
+                last_changed > last_automation and 
+                last_changed > 0):
+                self._manual_hold_entities.add(ent_id)
+            
+            # Skip if entity is in manual hold
+            if ent_id in self._manual_hold_entities:
                 continue
 
-            # Apply service call
+            # Apply service call and track our change
             payload = data_ct if mode == "ct" else data_rgb
             await self.hass.services.async_call(
                 "light",
@@ -127,6 +147,9 @@ class AdaptiveController:
                 {"entity_id": ent_id, **payload},
                 blocking=False,
             )
+            # Record that we made this change
+            import time
+            self._last_automation_change[ent_id] = time.time()
 
     # --------------------------- helpers ----------------------------------
     def _discover_targets(self) -> Dict[str, str]:
@@ -149,7 +172,8 @@ class AdaptiveController:
                     return False
             return True
 
-        for ent_id, state in self.hass.states.async_all("light"):
+        for state in self.hass.states.async_all("light"):
+            ent_id = state.entity_id
             if not allowed(ent_id):
                 continue
             attrs = state.attributes or {}
