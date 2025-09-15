@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta, time
 from typing import Dict, List, Optional, Set
@@ -99,12 +100,6 @@ class AdaptiveController:
         targets = self._discover_targets()
         # Determine target CT/brightness from sun/time
         b_pct, k = self._compute_targets()
-        # Apply
-        data_ct = {"transition": self.settings.transition, "brightness_pct": b_pct}
-        data_rgb = {"transition": self.settings.transition, "brightness_pct": b_pct}
-        data_ct["color_temp_kelvin"] = k
-        r, g, b = cct_to_rgb(k)
-        data_rgb["rgb_color"] = [r, g, b]
 
         for ent_id, mode in targets.items():
             state = self.hass.states.get(ent_id)
@@ -114,6 +109,7 @@ class AdaptiveController:
                 continue
 
             # Track when light was turned on
+            is_new_turn_on = False
             if state.state == "on":
                 state_changed = state.last_changed.timestamp() if state.last_changed else 0
                 last_turn_on = self._last_turn_on.get(ent_id, 0)
@@ -123,6 +119,7 @@ class AdaptiveController:
                     self._last_turn_on[ent_id] = state_changed
                     # Clear manual hold when light is turned on
                     self._manual_hold_entities.discard(ent_id)
+                    is_new_turn_on = True
 
             # Manual hold check: detect if user manually adjusted the light
             last_changed = state.last_changed.timestamp() if state.last_changed else 0
@@ -135,21 +132,44 @@ class AdaptiveController:
                 last_changed > 0):
                 self._manual_hold_entities.add(ent_id)
             
-            # Skip if entity is in manual hold
-            if ent_id in self._manual_hold_entities:
+            # Skip if entity is in manual hold (but not for new turn-on events)
+            if ent_id in self._manual_hold_entities and not is_new_turn_on:
                 continue
 
-            # Apply service call and track our change
-            payload = data_ct if mode == "ct" else data_rgb
-            await self.hass.services.async_call(
-                "light",
-                "turn_on",
-                {"entity_id": ent_id, **payload},
-                blocking=False,
-            )
-            # Record that we made this change
-            import time
-            self._last_automation_change[ent_id] = time.time()
+            # Apply light settings using the helper method
+            await self._apply_light_settings(ent_id, mode, b_pct, k)
+
+    async def _apply_light_settings(self, ent_id: str, mode: str, b_pct: int, k: int) -> None:
+        """Apply brightness and color settings to a specific light entity."""
+        # Prepare separate brightness and color data
+        data_brightness = {"transition": self.settings.transition, "brightness_pct": b_pct}
+        data_ct_color = {"transition": self.settings.transition, "color_temp_kelvin": k}
+        r, g, b = cct_to_rgb(k)
+        data_rgb_color = {"transition": self.settings.transition, "rgb_color": [r, g, b]}
+
+        # Apply brightness first
+        await self.hass.services.async_call(
+            "light",
+            "turn_on",
+            {"entity_id": ent_id, **data_brightness},
+            blocking=False,
+        )
+        
+        # Wait 200ms before applying color
+        await asyncio.sleep(0.2)
+        
+        # Apply color/temperature
+        color_payload = data_ct_color if mode == "ct" else data_rgb_color
+        await self.hass.services.async_call(
+            "light",
+            "turn_on",
+            {"entity_id": ent_id, **color_payload},
+            blocking=False,
+        )
+        
+        # Record that we made this change
+        import time
+        self._last_automation_change[ent_id] = time.time()
 
     # --------------------------- helpers ----------------------------------
     def _discover_targets(self) -> Dict[str, str]:
