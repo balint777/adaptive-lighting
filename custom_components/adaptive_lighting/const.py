@@ -1,4 +1,4 @@
-DOMAIN = "adaptive-lighting"
+DOMAIN = "adaptive_lighting"
 PLATFORMS = ["switch"]
 
 # Defaults
