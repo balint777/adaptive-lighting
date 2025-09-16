@@ -8,8 +8,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     s = Settings(
         night_start=entry.options.get("night_start", entry.data.get("night_start", "22:00")),
         night_end=entry.options.get("night_end", entry.data.get("night_end", "06:30")),
-        include_areas=entry.options.get("include_areas", entry.data.get("include_areas", [])),
-        include_entities=entry.options.get("include_entities", entry.data.get("include_entities", [])),
         exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
     )
 
@@ -32,8 +30,6 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         s = Settings(
             night_start=entry.options.get("night_start", entry.data.get("night_start", "22:00")),
             night_end=entry.options.get("night_end", entry.data.get("night_end", "06:30")),
-            include_areas=entry.options.get("include_areas", entry.data.get("include_areas", [])),
-            include_entities=entry.options.get("include_entities", entry.data.get("include_entities", [])),
             exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
         )
         # Update settings without full restart

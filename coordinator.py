@@ -12,23 +12,11 @@ from homeassistant.helpers import entity_registry, area_registry
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    ATTR_ELEVATION,
-    CONF_ONLY_WHEN_ON,
-    CONF_MANUAL_HOLD_S,
     CONF_NIGHT_START,
     CONF_NIGHT_END,
-    CONF_SLEEP_K,
-    CONF_SLEEP_B,
-    CONF_INCLUDE_AREAS,
     CONF_EXCLUDE_ENTITIES,
-    CONF_INCLUDE_ENTITIES,
-    CONF_AUTO_DISCOVER,
-    DEFAULT_ONLY_WHEN_ON,
-    DEFAULT_MANUAL_HOLD_S,
     DEFAULT_NIGHT_START,
-    DEFAULT_NIGHT_END,
-    DEFAULT_SLEEP_K,
-    DEFAULT_SLEEP_B,
+    DEFAULT_NIGHT_END
 )
 from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb
 
@@ -38,10 +26,6 @@ SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 class Settings:
     night_start: str = DEFAULT_NIGHT_START
     night_end: str = DEFAULT_NIGHT_END
-    sleep_k: int = DEFAULT_SLEEP_K
-    sleep_b: int = DEFAULT_SLEEP_B
-    include_areas: List[str] = field(default_factory=list)
-    include_entities: List[str] = field(default_factory=list)
     exclude_entities: List[str] = field(default_factory=list)
 
     # Hardcoded values (not configurable by user)
@@ -246,17 +230,8 @@ class AdaptiveController:
         area_reg = area_registry.async_get(self.hass)
 
         def allowed(ent_id: str) -> bool:
-            if self.settings.include_entities and ent_id not in self.settings.include_entities:
-                return False
             if ent_id in self.settings.exclude_entities:
                 return False
-            if self.settings.include_areas:
-                entry = ent_reg.async_get(ent_id)
-                if not entry or not entry.area_id:
-                    return False
-                area = area_reg.async_get_area(entry.area_id)
-                if not area or area.name not in self.settings.include_areas:
-                    return False
             return True
 
         for state in self.hass.states.async_all("light"):
@@ -298,7 +273,7 @@ class AdaptiveController:
         sun = self.hass.states.get("sun.sun")
         elev = -6.0
         if sun:
-            elev = float(sun.attributes.get(ATTR_ELEVATION, -6.0))
+            elev = float(sun.attributes.get("elevation", -6.0))
         tb = clamp((elev + 6.0) / (30.0 + 6.0), 0.0, 1.0)
         tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
         b = int(round(lerp(self.settings.min_b, self.settings.max_b, tb)))

@@ -24,8 +24,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return vol.Schema({
             vol.Optional("night_start", default="22:00"): str,
             vol.Optional("night_end", default="06:30"): str,
-            vol.Optional("include_areas"): selector.selector({"area": {"multiple": True}}),
-            vol.Optional("include_entities"): selector.selector({"entity": {"domain": "light", "multiple": True}}),
             vol.Optional("exclude_entities"): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })
 
@@ -55,7 +53,5 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return vol.Schema({
             vol.Optional("night_start", default=o.get("night_start", "22:00")): str,
             vol.Optional("night_end", default=o.get("night_end", "06:30")): str,
-            vol.Optional("include_areas", default=o.get("include_areas", [])): selector.selector({"area": {"multiple": True}}),
-            vol.Optional("include_entities", default=o.get("include_entities", [])): selector.selector({"entity": {"domain": "light", "multiple": True}}),
             vol.Optional("exclude_entities", default=o.get("exclude_entities", [])): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })
