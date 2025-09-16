@@ -56,7 +56,7 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 
 ### Manual Installation
 1. Download the latest release
-2. Copy the `adaptive-lighting` folder to your `custom_components` directory
+2. Copy the `adaptive_lighting` folder to your `custom_components` directory
 3. Restart Home Assistant
 4. Go to Configuration → Integrations
 5. Click "+" and search for "Adaptive Lighting"
