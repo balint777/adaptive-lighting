@@ -99,7 +99,7 @@ class AdaptiveController:
         # Determine targets
         targets = self._discover_targets()
         # Determine target CT/brightness from sun/time
-        b_pct, k = self._compute_targets()
+        brightness, k = self._compute_targets()
 
         for ent_id, mode in targets.items():
             state = self.hass.states.get(ent_id)
@@ -137,12 +137,12 @@ class AdaptiveController:
                 continue
 
             # Apply light settings using the helper method
-            await self._apply_light_settings(ent_id, mode, b_pct, k)
+            await self._apply_light_settings(ent_id, mode, brightness, k)
 
-    async def _apply_light_settings(self, ent_id: str, mode: str, b_pct: int, k: int) -> None:
+    async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
         """Apply brightness and color settings to a specific light entity."""
         # Prepare separate brightness and color data
-        data_brightness = {"transition": self.settings.transition, "brightness_pct": b_pct}
+        data_brightness = {"transition": self.settings.transition, "brightness_pct": brightness}
         data_ct_color = {"transition": self.settings.transition, "color_temp_kelvin": k}
         r, g, b = cct_to_rgb(k)
         data_rgb_color = {"transition": self.settings.transition, "rgb_color": [r, g, b]}
@@ -155,8 +155,8 @@ class AdaptiveController:
             blocking=False,
         )
         
-        # Wait 200ms before applying color
-        await asyncio.sleep(0.2)
+        # Wait transition before applying color
+        await asyncio.sleep(self.settings.transition)
         
         # Apply color/temperature
         color_payload = data_ct_color if mode == "ct" else data_rgb_color
