@@ -6,8 +6,8 @@ from .coordinator import AdaptiveController, Settings
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     s = Settings(
-        night_start=entry.options.get("night_start", entry.data.get("night_start", "22:00")),
-        night_end=entry.options.get("night_end", entry.data.get("night_end", "06:30")),
+        wind_down_target=entry.options.get("wind_down_target", entry.data.get("wind_down_target", "22:00")),
+        wake_up=entry.options.get("wake_up", entry.data.get("wake_up", "06:30")),
         exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
     )
 
@@ -28,8 +28,8 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if controller:
         # Create new settings object
         s = Settings(
-            night_start=entry.options.get("night_start", entry.data.get("night_start", "22:00")),
-            night_end=entry.options.get("night_end", entry.data.get("night_end", "06:30")),
+            wind_down_target=entry.options.get("wind_down_target", entry.data.get("wind_down_target", "22:00")),
+            wake_up=entry.options.get("wake_up", entry.data.get("wake_up", "06:30")),
             exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
         )
         # Update settings without full restart

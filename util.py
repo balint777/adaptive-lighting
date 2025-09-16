@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Iterable, Tuple
 
 
@@ -19,6 +19,65 @@ def in_window(now_t: time, start: time, end: time) -> bool:
     if start <= end:
         return start <= now_t < end
     return now_t >= start or now_t < end
+
+
+def time_difference_minutes(time1: time, time2: time) -> float:
+    """Calculate difference in minutes between two times, handling day boundary."""
+    dt1 = datetime.combine(datetime.today(), time1)
+    dt2 = datetime.combine(datetime.today(), time2)
+    
+    # If time2 is earlier than time1, it's the next day
+    if dt2 < dt1:
+        dt2 += timedelta(days=1)
+    
+    return (dt2 - dt1).total_seconds() / 60
+
+
+def subtract_hours_from_time(t: time, hours: float) -> time:
+    """Subtract hours from a time, handling day boundary."""
+    dt = datetime.combine(datetime.today(), t)
+    dt -= timedelta(hours=hours)
+    return dt.time()
+
+
+def add_hours_to_time(t: time, hours: float) -> time:
+    """Add hours to a time, handling day boundary."""
+    dt = datetime.combine(datetime.today(), t)
+    dt += timedelta(hours=hours)
+    return dt.time()
+
+
+def is_in_transition_period(now_t: time, wind_down_target: time, wake_up: time) -> Tuple[bool, str, float]:
+    """
+    Check if current time is in transition period and return progress.
+    
+    Returns:
+        (is_in_transition, wind_down, progress)
+        - is_in_transition: True if in a transition period
+        - wind_down: Boolean
+        - progress: 0.0 to 1.0, where 0.0 is start of transition, 1.0 is end
+    """
+    # Calculate transition windows
+    pre_night_start = subtract_hours_from_time(wind_down_target, 1.0)
+    post_night_end = add_hours_to_time(wake_up, 0.5)
+    
+    # Check if in pre-night transition (1 hour before wind_down_target)
+    if in_window(now_t, pre_night_start, wind_down_target):
+        # Calculate progress from 0.0 (at pre_night_start) to 1.0 (at wind_down_target)
+        total_minutes = time_difference_minutes(pre_night_start, wind_down_target)
+        elapsed_minutes = time_difference_minutes(pre_night_start, now_t)
+        progress = elapsed_minutes / total_minutes if total_minutes > 0 else 0.0
+        return True, True, clamp(progress, 0.0, 1.0)
+    
+    # Check if in post-night transition (1 hour after wake_up)
+    if in_window(now_t, wake_up, post_night_end):
+        # Calculate progress from 0.0 (at wake_up) to 1.0 (at post_night_end)
+        total_minutes = time_difference_minutes(wake_up, post_night_end)
+        elapsed_minutes = time_difference_minutes(wake_up, now_t)
+        progress = elapsed_minutes / total_minutes if total_minutes > 0 else 0.0
+        return True, False, clamp(progress, 0.0, 1.0)
+
+    return False, False, 0.0
 
 # Simple CCT(K) -> RGB approximation (not physically perfect, but good enough)
 # Source: widely-used approximation adapted for HA usage

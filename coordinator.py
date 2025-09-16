@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta, time
 from typing import Dict, List, Optional, Set
@@ -18,14 +19,14 @@ from .const import (
     DEFAULT_NIGHT_START,
     DEFAULT_NIGHT_END
 )
-from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb
+from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_transition_period
 
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 
 @dataclass
 class Settings:
-    night_start: str = DEFAULT_NIGHT_START
-    night_end: str = DEFAULT_NIGHT_END
+    wind_down_target: str = DEFAULT_NIGHT_START
+    wake_up: str = DEFAULT_NIGHT_END
     exclude_entities: List[str] = field(default_factory=list)
 
     # Hardcoded values (not configurable by user)
@@ -36,6 +37,14 @@ class Settings:
     @property
     def transition(self) -> int:
         return 2 # seconds
+    
+    @property
+    def sleep_b(self) -> int:
+        return 1 # 1% brightness during sleep
+    
+    @property
+    def sleep_k(self) -> int:
+        return 2200 # warm color temperature during sleep
 
 
 
@@ -46,7 +55,6 @@ class AdaptiveController:
         self._unsub = None
         self._event_unsub = None  # For event tracking
         self._manual_hold_entities: Set[str] = set()  # Entities with manual adjustments
-        self._last_turn_on: Dict[str, float] = {}  # Track when entities were turned on
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
         self._enabled = True
 
@@ -138,7 +146,6 @@ class AdaptiveController:
         )
         
         # Record that we made this change
-        import time
         self._last_automation_change[ent_id] = time.time()
 
     @callback
@@ -168,7 +175,6 @@ class AdaptiveController:
         if new_state.state == "on" and (not old_state or old_state.state != "on"):
             # Light was turned on - clear manual hold and apply settings
             self._manual_hold_entities.discard(entity_id)
-            self._last_turn_on[entity_id] = new_state.last_changed.timestamp() if new_state.last_changed else 0
 
             # Get current adaptive settings and apply immediately
             b_pct, k = self._compute_targets()
@@ -239,18 +245,32 @@ class AdaptiveController:
         return out
 
     def _compute_targets(self):
-        # Sleep window override
         now = dt_util.now().time()
-        if in_window(now, parse_time_str(self.settings.night_start), parse_time_str(self.settings.night_end)):
+        wind_down_target = parse_time_str(self.settings.wind_down_target)
+        wake_up = parse_time_str(self.settings.wake_up)
+        
+        # Sleep window override
+        if in_window(now, wind_down_target, wake_up):
             return (self.settings.sleep_b, self.settings.sleep_k)
+        
+        # Check if we're in a transition period
+        is_transition, wind_down, progress = is_in_transition_period(now, wind_down_target, wake_up)
 
+        if is_transition:
+            if wind_down:
+                # Gradually transition from 100% to Sleep Brightness
+                b = int(round(lerp(100, self.settings.sleep_b, progress)))
+            else:
+                # Gradually brighten from Sleep Brightness to 100% over 1 hour after wake_up
+                b = int(round(lerp(self.settings.sleep_b, 100, progress)))
+        else:
+            b = 100
+        
+        # Sun color temperature calculation
         sun = self.hass.states.get("sun.sun")
         elev = -6.0
         if sun:
             elev = float(sun.attributes.get("elevation", -6.0))
-
-        tb = clamp((elev + 6.0) / (30.0 + 6.0), 0.0, 1.0)
-        b = int(round(lerp(1, 100, tb)))
 
         tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
         k = int(round(lerp(2200, 6500, tk)))

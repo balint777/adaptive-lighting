@@ -1,5 +1,4 @@
 {
-    "title": "Adaptive Lighting",
     "config": {
         "step": {
             "user": {
@@ -16,8 +15,8 @@
     "options": {
         "step": {
             "init": {
-                "title": "Adaptive Lighting Settings", 
-                "description": "Adjust when night mode begins and ends. Lights will start dimming 1 hour before night start and reach full brightness 1 hour after night end.",
+                "title": "Adaptive Lighting Settings",
+                "description": "Adjust when night mode begins and ends. Lights will start dimming 1 hour before night start and reach full brightness 30 minutes after night end.",
                 "data": {
                     "wind_down_target": "Wind Down Target Time",
                     "wake_up": "Wake Up Time",

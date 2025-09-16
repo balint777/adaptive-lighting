@@ -22,8 +22,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _schema(self):
         import voluptuous as vol
         return vol.Schema({
-            vol.Optional("night_start", default="22:00"): str,
-            vol.Optional("night_end", default="06:30"): str,
+            vol.Optional("wind_down_target", default="22:00"): selector.selector({"time": {}}),
+            vol.Optional("wake_up", default="06:30"): selector.selector({"time": {}}),
             vol.Optional("exclude_entities"): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })
 
@@ -51,7 +51,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         from homeassistant.helpers import selector
         o = self.config_entry.options
         return vol.Schema({
-            vol.Optional("night_start", default=o.get("night_start", "22:00")): str,
-            vol.Optional("night_end", default=o.get("night_end", "06:30")): str,
+            vol.Optional("wind_down_target", default=o.get("wind_down_target", "22:00")): selector.selector({"time": {}}),
+            vol.Optional("wake_up", default=o.get("wake_up", "06:30")): selector.selector({"time": {}}),
             vol.Optional("exclude_entities", default=o.get("exclude_entities", [])): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })
