@@ -1,0 +1,10 @@
+{
+    "name": "Adaptive Lighting",
+    "content_in_root": false,
+    "filename": "adaptive-lighting",
+    "country": [],
+    "homeassistant": "2023.1.0",
+    "render_readme": true,
+    "zip_release": true,
+    "hide_default_branch": false
+}
