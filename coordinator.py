@@ -232,7 +232,8 @@ class AdaptiveController:
         elev = -6.0
         if sun:
             elev = float(sun.attributes.get(ATTR_ELEVATION, -6.0))
-        t = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
-        b = int(round(lerp(self.settings.min_b, self.settings.max_b, t)))
-        k = int(round(lerp(self.settings.min_k, self.settings.max_k, t)))
+        tb = clamp((elev + 6.0) / (30.0 + 6.0), 0.0, 1.0)
+        tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
+        b = int(round(lerp(self.settings.min_b, self.settings.max_b, tb)))
+        k = int(round(lerp(self.settings.min_k, self.settings.max_k, tk)))
         return (b, k)
