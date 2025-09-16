@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta, time
 from typing import Dict, List, Optional, Set
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.const import ATTR_SUPPORTED_FEATURES
+from homeassistant.core import HomeAssistant, callback, Event
+from homeassistant.const import ATTR_SUPPORTED_FEATURES, EVENT_STATE_CHANGED
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers import entity_registry, area_registry
@@ -13,12 +13,6 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_ELEVATION,
-    CONF_INTERVAL,
-    CONF_TRANSITION,
-    CONF_MIN_K,
-    CONF_MAX_K,
-    CONF_MIN_B,
-    CONF_MAX_B,
     CONF_ONLY_WHEN_ON,
     CONF_MANUAL_HOLD_S,
     CONF_NIGHT_START,
@@ -29,12 +23,6 @@ from .const import (
     CONF_EXCLUDE_ENTITIES,
     CONF_INCLUDE_ENTITIES,
     CONF_AUTO_DISCOVER,
-    DEFAULT_INTERVAL,
-    DEFAULT_TRANSITION,
-    DEFAULT_MIN_K,
-    DEFAULT_MAX_K,
-    DEFAULT_MIN_B,
-    DEFAULT_MAX_B,
     DEFAULT_ONLY_WHEN_ON,
     DEFAULT_MANUAL_HOLD_S,
     DEFAULT_NIGHT_START,
@@ -48,22 +36,38 @@ SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 
 @dataclass
 class Settings:
-    interval: int = DEFAULT_INTERVAL
-    transition: int = DEFAULT_TRANSITION
-    min_k: int = DEFAULT_MIN_K
-    max_k: int = DEFAULT_MAX_K
-    min_b: int = DEFAULT_MIN_B
-    max_b: int = DEFAULT_MAX_B
-    only_when_on: bool = DEFAULT_ONLY_WHEN_ON
-    manual_hold_s: int = DEFAULT_MANUAL_HOLD_S
     night_start: str = DEFAULT_NIGHT_START
     night_end: str = DEFAULT_NIGHT_END
     sleep_k: int = DEFAULT_SLEEP_K
     sleep_b: int = DEFAULT_SLEEP_B
-    auto_discover: bool = True
     include_areas: List[str] = field(default_factory=list)
     include_entities: List[str] = field(default_factory=list)
     exclude_entities: List[str] = field(default_factory=list)
+
+    # Hardcoded values (not configurable by user)
+    @property
+    def interval(self) -> int:
+        return 120 # seconds
+    
+    @property
+    def transition(self) -> int:
+        return 2 # seconds
+
+    @property
+    def min_b(self) -> int:
+        return 1 # %
+    
+    @property
+    def max_b(self) -> int:
+        return 100 # %
+
+    @property
+    def min_k(self) -> int:
+        return 2200 # K
+    
+    @property
+    def max_k(self) -> int:
+        return 6500 # K
 
 
 class AdaptiveController:
@@ -71,6 +75,7 @@ class AdaptiveController:
         self.hass = hass
         self.settings = settings
         self._unsub = None
+        self._event_unsub = None  # For event tracking
         self._manual_hold_entities: Set[str] = set()  # Entities with manual adjustments
         self._last_turn_on: Dict[str, float] = {}  # Track when entities were turned on
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
@@ -82,15 +87,46 @@ class AdaptiveController:
     def is_enabled(self) -> bool:
         return self._enabled
 
+    def clear_manual_hold(self, entity_id: str = None) -> None:
+        """Clear manual hold for a specific entity or all entities."""
+        if entity_id:
+            self._manual_hold_entities.discard(entity_id)
+        else:
+            self._manual_hold_entities.clear()
+
+    def get_manual_hold_entities(self) -> Set[str]:
+        """Get the set of entities currently in manual hold."""
+        return self._manual_hold_entities.copy()
+
+    def update_settings(self, new_settings: Settings) -> None:
+        """Update settings without restarting the controller."""
+        old_interval = self.settings.interval
+        self.settings = new_settings
+        
+        # If interval changed, restart the timer
+        if old_interval != new_settings.interval:
+            if self._unsub:
+                self._unsub()
+                interval = timedelta(seconds=self.settings.interval)
+                self._unsub = async_track_time_interval(self.hass, self._apply_all, interval)
+
     def start(self):
         self.stop()
         interval = timedelta(seconds=self.settings.interval)
         self._unsub = async_track_time_interval(self.hass, self._apply_all, interval)
+        
+        # Set up event listener for state change events
+        self._event_unsub = self.hass.bus.async_listen(
+            EVENT_STATE_CHANGED, self._handle_light_turn_on
+        )
 
     def stop(self):
         if self._unsub:
             self._unsub()
             self._unsub = None
+        if self._event_unsub:
+            self._event_unsub()
+            self._event_unsub = None
 
     @callback
     async def _apply_all(self, _now=None):
@@ -105,38 +141,14 @@ class AdaptiveController:
             state = self.hass.states.get(ent_id)
             if not state:
                 continue
-            if self.settings.only_when_on and state.state != "on":
+            if state.state != "on":
                 continue
 
-            # Track when light was turned on
-            is_new_turn_on = False
-            if state.state == "on":
-                state_changed = state.last_changed.timestamp() if state.last_changed else 0
-                last_turn_on = self._last_turn_on.get(ent_id, 0)
-                
-                # If this is a new turn-on event, clear manual hold and update turn-on time
-                if state_changed > last_turn_on:
-                    self._last_turn_on[ent_id] = state_changed
-                    # Clear manual hold when light is turned on
-                    self._manual_hold_entities.discard(ent_id)
-                    is_new_turn_on = True
-
-            # Manual hold check: detect if user manually adjusted the light
-            last_changed = state.last_changed.timestamp() if state.last_changed else 0
-            last_turn_on = self._last_turn_on.get(ent_id, 0)
-            last_automation = self._last_automation_change.get(ent_id, 0)
-            
-            # If the light changed after turn-on and it wasn't from our automation, it's manual
-            if (last_changed > last_turn_on and 
-                last_changed > last_automation and 
-                last_changed > 0):
-                self._manual_hold_entities.add(ent_id)
-            
-            # Skip if entity is in manual hold (but not for new turn-on events)
-            if ent_id in self._manual_hold_entities and not is_new_turn_on:
+            # Skip if entity is in manual hold
+            if ent_id in self._manual_hold_entities:
                 continue
 
-            # Apply light settings using the helper method
+            # Apply light settings for periodic updates (not turn-on events)
             await self._apply_light_settings(ent_id, mode, brightness, k)
 
     async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
@@ -170,6 +182,61 @@ class AdaptiveController:
         # Record that we made this change
         import time
         self._last_automation_change[ent_id] = time.time()
+
+    @callback
+    async def _handle_light_turn_on(self, event: Event) -> None:
+        """Handle state change events for manual hold detection and turn-on control."""
+        if not self._enabled:
+            return
+
+        # Check if this is a light event
+        event_data = event.data
+        entity_id = event_data.get("entity_id")
+        old_state = event_data.get("old_state")
+        new_state = event_data.get("new_state")
+
+        if not entity_id or not entity_id.startswith("light."):
+            return
+
+        if not new_state:
+            return
+
+        # Check if this light is a valid target
+        targets = self._discover_targets()
+        if entity_id not in targets:
+            return
+
+        # Handle turn-on events
+        if new_state.state == "on" and (not old_state or old_state.state != "on"):
+            # Light was turned on - clear manual hold and apply settings
+            self._manual_hold_entities.discard(entity_id)
+            self._last_turn_on[entity_id] = new_state.last_changed.timestamp() if new_state.last_changed else 0
+
+            # Get current adaptive settings and apply immediately
+            b_pct, k = self._compute_targets()
+            mode = targets[entity_id]
+            await self._apply_light_settings(entity_id, mode, b_pct, k)
+            return
+
+        # Handle manual adjustments (only for lights that are on)
+        if new_state.state == "on" and old_state and old_state.state == "on":
+            # Check if this was a manual change (not from our automation)
+            last_automation = self._last_automation_change.get(entity_id, 0)
+            state_changed = new_state.last_changed.timestamp() if new_state.last_changed else 0
+            
+            # If the change happened after our last automation change, it's likely manual
+            if state_changed > last_automation + 1:  # 1 second grace period
+                # Check if brightness or color actually changed
+                old_attrs = old_state.attributes or {}
+                new_attrs = new_state.attributes or {}
+                
+                brightness_changed = old_attrs.get("brightness") != new_attrs.get("brightness")
+                color_temp_changed = old_attrs.get("color_temp") != new_attrs.get("color_temp")
+                rgb_color_changed = old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
+                
+                if brightness_changed or color_temp_changed or rgb_color_changed:
+                    # This looks like a manual adjustment - add to manual hold
+                    self._manual_hold_entities.add(entity_id)
 
     # --------------------------- helpers ----------------------------------
     def _discover_targets(self) -> Dict[str, str]:
