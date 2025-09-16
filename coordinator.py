@@ -37,21 +37,6 @@ class Settings:
     def transition(self) -> int:
         return 2 # seconds
 
-    @property
-    def min_b(self) -> int:
-        return 1 # %
-    
-    @property
-    def max_b(self) -> int:
-        return 100 # %
-
-    @property
-    def min_k(self) -> int:
-        return 2200 # K
-    
-    @property
-    def max_k(self) -> int:
-        return 6500 # K
 
 
 class AdaptiveController:
@@ -70,17 +55,6 @@ class AdaptiveController:
 
     def is_enabled(self) -> bool:
         return self._enabled
-
-    def clear_manual_hold(self, entity_id: str = None) -> None:
-        """Clear manual hold for a specific entity or all entities."""
-        if entity_id:
-            self._manual_hold_entities.discard(entity_id)
-        else:
-            self._manual_hold_entities.clear()
-
-    def get_manual_hold_entities(self) -> Set[str]:
-        """Get the set of entities currently in manual hold."""
-        return self._manual_hold_entities.copy()
 
     def update_settings(self, new_settings: Settings) -> None:
         """Update settings without restarting the controller."""
@@ -274,8 +248,11 @@ class AdaptiveController:
         elev = -6.0
         if sun:
             elev = float(sun.attributes.get("elevation", -6.0))
+
         tb = clamp((elev + 6.0) / (30.0 + 6.0), 0.0, 1.0)
+        b = int(round(lerp(1, 100, tb)))
+
         tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
-        b = int(round(lerp(self.settings.min_b, self.settings.max_b, tb)))
-        k = int(round(lerp(self.settings.min_k, self.settings.max_k, tk)))
+        k = int(round(lerp(2200, 6500, tk)))
+
         return (b, k)
