@@ -1,4 +1,4 @@
-![Project Logo](icon.svg)
+![Project Logo](custom_components/adaptive_lighting/icon.svg)
 # Adaptive Lighting for Home Assistant
 
 Automatically adjust the color temperature and brightness of your lights throughout the day to match natural lighting patterns and improve your circadian rhythm.
