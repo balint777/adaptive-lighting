@@ -54,7 +54,7 @@ class AdaptiveController:
         self.settings = settings
         self._unsub = None
         self._event_unsub = None  # For event tracking
-        self._manual_hold_entities: Set[str] = set()  # Entities with manual adjustments
+        self._manual_hold_entities: Dict[str, float] = {}  # Entities with manual adjustments (entity_id -> timestamp)
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
         self._pending_tasks: Dict[str, asyncio.Task] = {}  # Track pending operations per entity
         self._enabled = True
@@ -103,6 +103,13 @@ class AdaptiveController:
         targets = self._discover_targets()
         # Determine target CT/brightness from sun/time
         brightness, k = self._compute_targets()
+        
+        # Clear expired manual holds (older than 2 hours)
+        current_time = time.time()
+        expired_holds = [ent_id for ent_id, timestamp in self._manual_hold_entities.items() 
+                        if current_time - timestamp > 7200]  # 2 hours in seconds
+        for ent_id in expired_holds:
+            del self._manual_hold_entities[ent_id]
 
         for ent_id, mode in targets.items():
             state = self.hass.states.get(ent_id)
@@ -183,12 +190,16 @@ class AdaptiveController:
             if entity_id in self._pending_tasks:
                 self._pending_tasks[entity_id].cancel()
                 del self._pending_tasks[entity_id]
+            # Clear manual hold when light is turned off
+            if entity_id in self._manual_hold_entities:
+                del self._manual_hold_entities[entity_id]
             return
 
         # Handle turn-on events
         if new_state.state == "on" and (not old_state or old_state.state != "on"):
             # Light was turned on - clear manual hold and cancel any pending tasks
-            self._manual_hold_entities.discard(entity_id)
+            if entity_id in self._manual_hold_entities:
+                del self._manual_hold_entities[entity_id]
             
             # Cancel any pending task for this entity
             if entity_id in self._pending_tasks:
@@ -228,7 +239,7 @@ class AdaptiveController:
                 
                 if brightness_changed or color_temp_changed or rgb_color_changed:
                     # This looks like a manual adjustment - add to manual hold
-                    self._manual_hold_entities.add(entity_id)
+                    self._manual_hold_entities[entity_id] = time.time()
 
     # --------------------------- helpers ----------------------------------
     def _discover_targets(self) -> Dict[str, str]:
