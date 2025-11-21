@@ -56,6 +56,7 @@ class AdaptiveController:
         self._event_unsub = None  # For event tracking
         self._manual_hold_entities: Set[str] = set()  # Entities with manual adjustments
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
+        self._pending_tasks: Dict[str, asyncio.Task] = {}  # Track pending operations per entity
         self._enabled = True
 
     def set_enabled(self, enabled: bool) -> None:
@@ -136,6 +137,12 @@ class AdaptiveController:
         # Wait transition before applying color
         await asyncio.sleep(self.settings.transition)
         
+        # Check if light is still on before applying color
+        state = self.hass.states.get(ent_id)
+        if not state or state.state != "on":
+            # Light was turned off during transition, don't apply color
+            return
+        
         # Apply color/temperature
         color_payload = data_ct_color if mode == "ct" else data_rgb_color
         await self.hass.services.async_call(
@@ -170,16 +177,37 @@ class AdaptiveController:
         targets = self._discover_targets()
         if entity_id not in targets:
             return
+        
+        # Handle turn-off events - cancel any pending operations
+        if new_state.state == "off" and old_state and old_state.state == "on":
+            if entity_id in self._pending_tasks:
+                self._pending_tasks[entity_id].cancel()
+                del self._pending_tasks[entity_id]
+            return
 
         # Handle turn-on events
         if new_state.state == "on" and (not old_state or old_state.state != "on"):
-            # Light was turned on - clear manual hold and apply settings
+            # Light was turned on - clear manual hold and cancel any pending tasks
             self._manual_hold_entities.discard(entity_id)
+            
+            # Cancel any pending task for this entity
+            if entity_id in self._pending_tasks:
+                self._pending_tasks[entity_id].cancel()
+                del self._pending_tasks[entity_id]
 
             # Get current adaptive settings and apply immediately
             b_pct, k = self._compute_targets()
             mode = targets[entity_id]
-            await self._apply_light_settings(entity_id, mode, b_pct, k)
+            
+            # Create and track the task
+            task = asyncio.create_task(self._apply_light_settings(entity_id, mode, b_pct, k))
+            self._pending_tasks[entity_id] = task
+            
+            # Clean up task when done
+            def cleanup(_):
+                if entity_id in self._pending_tasks:
+                    del self._pending_tasks[entity_id]
+            task.add_done_callback(cleanup)
             return
 
         # Handle manual adjustments (only for lights that are on)
