@@ -32,7 +32,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+        super().__init__()
+        self._config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
@@ -49,7 +50,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     def _schema(self):
         import voluptuous as vol
         from homeassistant.helpers import selector
-        o = self.config_entry.options
+        o = self._config_entry.options
         return vol.Schema({
             vol.Optional("wind_down_target", default=o.get("wind_down_target", "22:00")): selector.selector({"time": {}}),
             vol.Optional("wake_up", default=o.get("wake_up", "06:30")): selector.selector({"time": {}}),

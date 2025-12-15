@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import timedelta, time
+from datetime import timedelta
 from typing import Dict, List, Optional, Set
 
 from homeassistant.core import HomeAssistant, callback, Event
@@ -57,6 +57,7 @@ class AdaptiveController:
         self._manual_hold_entities: Dict[str, float] = {}  # Entities with manual adjustments (entity_id -> timestamp)
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
         self._pending_tasks: Dict[str, asyncio.Task] = {}  # Track pending operations per entity
+        self._cancelled_entities: Set[str] = set()  # Entities that should stop processing
         self._enabled = True
 
     def set_enabled(self, enabled: bool) -> None:
@@ -127,35 +128,61 @@ class AdaptiveController:
 
     async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
         """Apply brightness and color settings to a specific light entity."""
-        # Prepare separate brightness and color data
-        data_brightness = {"transition": self.settings.transition, "brightness_pct": brightness}
-        data_ct_color = {"transition": self.settings.transition, "color_temp_kelvin": k}
-        r, g, b = cct_to_rgb(k)
-        data_rgb_color = {"transition": self.settings.transition, "rgb_color": [r, g, b]}
-
-        # Apply brightness first
-        await self.hass.services.async_call(
-            "light",
-            "turn_on",
-            {"entity_id": ent_id, **data_brightness},
-            blocking=False,
-        )
-        
-        # Wait transition before applying color
-        await asyncio.sleep(self.settings.transition)
-        
-        # Check if light is still on before applying color
-        state = self.hass.states.get(ent_id)
-        if not state or state.state != "on":
-            # Light was turned off during transition, don't apply color
+        # Check if cancelled before starting
+        if ent_id in self._cancelled_entities:
             return
         
-        # Apply color/temperature
-        color_payload = data_ct_color if mode == "ct" else data_rgb_color
+        # Check light state before applying settings
+        state = self.hass.states.get(ent_id)
+        if not state or state.state != "on":
+            return
+
+        # Record timestamp before making changes
+        self._last_automation_change[ent_id] = time.time()
+            
+        # Apply brightness first (blocking to ensure it completes before we can be cancelled)
         await self.hass.services.async_call(
             "light",
             "turn_on",
-            {"entity_id": ent_id, **color_payload},
+            {
+                "entity_id": ent_id,
+                "transition": self.settings.transition,
+                "brightness_pct": brightness
+            },
+            blocking=True,
+        )
+        
+        # if supported_color_modes == ColorMode.WHITE:
+        # return
+
+        # Wait for transition to complete
+        await asyncio.sleep(self.settings.transition)
+        
+        
+        # Prepare color data based on mode
+        if mode == "ct":
+            color_data = {"color_temp_kelvin": k}
+        else:
+            r, g, b = cct_to_rgb(k)
+            color_data = {"rgb_color": [r, g, b]}
+        
+        # Check cancellation and light state before applying color
+        if ent_id in self._cancelled_entities:
+            return
+
+        state = self.hass.states.get(ent_id)
+        if not state or state.state != "on":
+            return
+
+        # Apply color/temperature (blocking to ensure it completes)
+        self.hass.services.async_call(
+            "light",
+            "turn_on",
+            {
+                "entity_id": ent_id,
+                "transition": self.settings.transition,
+                **color_data
+            },
             blocking=False,
         )
         
@@ -187,6 +214,8 @@ class AdaptiveController:
         
         # Handle turn-off events - cancel any pending operations
         if new_state.state == "off" and old_state and old_state.state == "on":
+            # Mark entity as cancelled to prevent any pending service calls
+            self._cancelled_entities.add(entity_id)
             if entity_id in self._pending_tasks:
                 self._pending_tasks[entity_id].cancel()
                 del self._pending_tasks[entity_id]
@@ -197,10 +226,10 @@ class AdaptiveController:
 
         # Handle turn-on events
         if new_state.state == "on" and (not old_state or old_state.state != "on"):
-            # Light was turned on - clear manual hold and cancel any pending tasks
+            # Light was turned on - clear manual hold and cancellation flag
+            self._cancelled_entities.discard(entity_id)
             if entity_id in self._manual_hold_entities:
                 del self._manual_hold_entities[entity_id]
-            
             # Cancel any pending task for this entity
             if entity_id in self._pending_tasks:
                 self._pending_tasks[entity_id].cancel()

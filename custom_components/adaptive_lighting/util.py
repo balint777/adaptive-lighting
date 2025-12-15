@@ -12,7 +12,13 @@ def lerp(a: float, b: float, t: float) -> float:
 
 
 def parse_time_str(s: str) -> time:
-    return datetime.strptime(s, "%H:%M").time()
+    """Parse time string that may include seconds."""
+    try:
+        # Try with seconds first
+        return datetime.strptime(s, "%H:%M:%S").time()
+    except ValueError:
+        # Fall back to format without seconds
+        return datetime.strptime(s, "%H:%M").time()
 
 
 def in_window(now_t: time, start: time, end: time) -> bool:
