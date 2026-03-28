@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -25,6 +26,7 @@ MAX_CONCURRENT_LIGHT_UPDATES = 6
 TRACKING_STALE_SECONDS = 24 * 60 * 60
 SERVICE_ERROR_LOG_INTERVAL_SECONDS = 5 * 60
 CONFIG_WARNING_LOG_INTERVAL_SECONDS = 5 * 60
+SERVICE_CALL_TIMEOUT_SECONDS = 15
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -125,6 +127,8 @@ class AdaptiveController:
         async with self._apply_all_lock:
             try:
                 await self._run_apply_all()
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 _LOGGER.exception("Unexpected error in periodic adaptive update cycle")
 
@@ -292,10 +296,16 @@ class AdaptiveController:
     def _clear_stale_tracking(self) -> None:
         """Prune stale automation timestamps for entities not updated recently."""
         now = time.time()
+        existing_lights = {state.entity_id for state in self.hass.states.async_all("light")}
+
+        for ent_id in tuple(self._manual_hold_entities):
+            if ent_id not in existing_lights:
+                self._manual_hold_entities.pop(ent_id, None)
+
         stale = [
             ent_id
             for ent_id, ts in self._last_automation_change.items()
-            if now - ts > TRACKING_STALE_SECONDS
+            if now - ts > TRACKING_STALE_SECONDS or ent_id not in existing_lights
         ]
         for ent_id in stale:
             self._last_automation_change.pop(ent_id, None)
@@ -303,12 +313,11 @@ class AdaptiveController:
         stale_service_logs = [
             ent_id
             for ent_id, ts in self._last_service_error_log_at.items()
-            if now - ts > TRACKING_STALE_SECONDS
+            if now - ts > TRACKING_STALE_SECONDS or ent_id not in existing_lights
         ]
         for ent_id in stale_service_logs:
             self._last_service_error_log_at.pop(ent_id, None)
 
-        existing_lights = {state.entity_id for state in self.hass.states.async_all("light")}
         self._cancelled_entities.intersection_update(existing_lights)
 
     def _get_targets_cached(self) -> Dict[str, str]:
@@ -405,17 +414,33 @@ class AdaptiveController:
     async def _safe_turn_on(self, ent_id: str, service_data: dict) -> bool:
         """Call light.turn_on safely and report failures without breaking loop."""
         try:
-            await self.hass.services.async_call(
-                LIGHT_DOMAIN,
-                "turn_on",
-                {
-                    "entity_id": ent_id,
-                    **service_data,
-                },
-                blocking=True,
+            await asyncio.wait_for(
+                self.hass.services.async_call(
+                    LIGHT_DOMAIN,
+                    "turn_on",
+                    {
+                        "entity_id": ent_id,
+                        **service_data,
+                    },
+                    blocking=True,
+                ),
+                timeout=SERVICE_CALL_TIMEOUT_SECONDS,
             )
             self._last_service_error_log_at.pop(ent_id, None)
             return True
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            now = time.time()
+            last_logged = self._last_service_error_log_at.get(ent_id, 0.0)
+            if now - last_logged >= SERVICE_ERROR_LOG_INTERVAL_SECONDS:
+                self._last_service_error_log_at[ent_id] = now
+                _LOGGER.warning(
+                    "Adaptive Lighting timed out while updating %s (throttled log, retrying automatically)",
+                    ent_id,
+                )
+            _LOGGER.debug("Service call timed out for %s with payload %s", ent_id, service_data)
+            return False
         except Exception as err:
             now = time.time()
             last_logged = self._last_service_error_log_at.get(ent_id, 0.0)
@@ -530,8 +555,12 @@ class AdaptiveController:
                 elev = float(sun.attributes.get("elevation", -6.0))
             except (TypeError, ValueError):
                 elev = -6.0
+            if not math.isfinite(elev):
+                elev = -6.0
 
         tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
-        k = int(round(lerp(2200, 6500, tk)))
+        k = int(round(clamp(lerp(2200, 6500, tk), 2200, 6500)))
+
+        b = int(round(clamp(b, self.settings.sleep_b, 100)))
 
         return (b, k)
