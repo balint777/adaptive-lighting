@@ -3,13 +3,11 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
-from homeassistant.core import HomeAssistant, callback, Event
-from homeassistant.const import ATTR_SUPPORTED_FEATURES, EVENT_STATE_CHANGED
-from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
+from homeassistant.core import HomeAssistant, Event, callback
+from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers import entity_registry, area_registry
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -22,6 +20,7 @@ from .const import (
 from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_transition_period
 
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
+RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
 
 @dataclass
 class Settings:
@@ -96,7 +95,6 @@ class AdaptiveController:
             self._event_unsub()
             self._event_unsub = None
 
-    @callback
     async def _apply_all(self, _now=None):
         if not self._enabled:
             return
@@ -162,9 +160,12 @@ class AdaptiveController:
         # Prepare color data based on mode
         if mode == "ct":
             color_data = {"color_temp_kelvin": k}
-        else:
+        elif mode == "rgb":
             r, g, b = cct_to_rgb(k)
             color_data = {"rgb_color": [r, g, b]}
+        else:
+            # Brightness-only light: skip color update.
+            return
         
         # Check cancellation and light state before applying color
         if ent_id in self._cancelled_entities:
@@ -190,7 +191,7 @@ class AdaptiveController:
         self._last_automation_change[ent_id] = time.time()
 
     @callback
-    async def _handle_light_turn_on(self, event: Event) -> None:
+    def _handle_light_turn_on(self, event: Event) -> None:
         """Handle state change events for manual hold detection and turn-on control."""
         if not self._enabled:
             return
@@ -264,9 +265,10 @@ class AdaptiveController:
                 
                 brightness_changed = old_attrs.get("brightness") != new_attrs.get("brightness")
                 color_temp_changed = old_attrs.get("color_temp") != new_attrs.get("color_temp")
+                color_temp_kelvin_changed = old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
                 rgb_color_changed = old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
                 
-                if brightness_changed or color_temp_changed or rgb_color_changed:
+                if brightness_changed or color_temp_changed or color_temp_kelvin_changed or rgb_color_changed:
                     # This looks like a manual adjustment - add to manual hold
                     self._manual_hold_entities[entity_id] = time.time()
 
@@ -295,12 +297,27 @@ class AdaptiveController:
                 modes = color_modes
             elif isinstance(color_modes, list):
                 modes = set(color_modes)
+            elif isinstance(color_modes, tuple):
+                modes = set(color_modes)
+            elif isinstance(color_modes, str):
+                modes = {color_modes}
             else:
                 modes = set()
 
-            has_brightness = "brightness" in attrs or "brightness" in modes
-            supports_ct = "color_temp" in modes or "color_temp" in attrs
-            supports_rgb = any(m in modes for m in ("hs", "rgb"))
+            # Newer HA/device stacks can expose capabilities via multiple attrs/modes.
+            has_brightness = (
+                "brightness" in attrs
+                or "brightness" in modes
+                or any(m in modes for m in ("color_temp", *RGB_LIKE_MODES, "white"))
+            )
+            supports_ct = (
+                "color_temp" in modes
+                or "color_temp" in attrs
+                or "color_temp_kelvin" in attrs
+                or "min_color_temp_kelvin" in attrs
+                or "max_color_temp_kelvin" in attrs
+            )
+            supports_rgb = any(m in modes for m in RGB_LIKE_MODES)
 
             if not has_brightness:
                 continue
@@ -308,6 +325,8 @@ class AdaptiveController:
                 out[ent_id] = "ct"
             elif supports_rgb:
                 out[ent_id] = "rgb"
+            else:
+                out[ent_id] = "brightness"
         return out
 
     def _compute_targets(self):
