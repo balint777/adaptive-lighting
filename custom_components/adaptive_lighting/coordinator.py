@@ -306,8 +306,10 @@ class AdaptiveController:
     def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:
         """Track manual user adjustments and hold adaptive updates temporarily."""
         last_automation = self._last_automation_change.get(entity_id, 0)
-        state_changed = new_state.last_changed.timestamp() if new_state.last_changed else 0
-        if state_changed <= last_automation + AUTOMATION_GRACE_SECONDS:
+        # last_changed only updates when state changes (on/off). For brightness/color
+        # adjustments we must use last_updated to detect attribute-only manual changes.
+        state_updated = new_state.last_updated.timestamp() if new_state.last_updated else 0
+        if state_updated <= last_automation + AUTOMATION_GRACE_SECONDS:
             return
 
         old_attrs = old_state.attributes or {}
