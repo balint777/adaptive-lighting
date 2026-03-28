@@ -36,7 +36,7 @@ class Settings:
     
     @property
     def transition(self) -> int:
-        return 2 # seconds
+        return 1 # seconds
     
     @property
     def sleep_b(self) -> int:
@@ -149,7 +149,7 @@ class AdaptiveController:
                 "transition": self.settings.transition,
                 "brightness_pct": brightness
             },
-            blocking=True,
+            blocking=True
         )
         
         # if supported_color_modes == ColorMode.WHITE:
@@ -175,7 +175,7 @@ class AdaptiveController:
             return
 
         # Apply color/temperature (blocking to ensure it completes)
-        self.hass.services.async_call(
+        await self.hass.services.async_call(
             "light",
             "turn_on",
             {
@@ -183,7 +183,7 @@ class AdaptiveController:
                 "transition": self.settings.transition,
                 **color_data
             },
-            blocking=False,
+            blocking=True
         )
         
         # Record that we made this change
@@ -274,8 +274,6 @@ class AdaptiveController:
     def _discover_targets(self) -> Dict[str, str]:
         # Return mapping entity_id -> mode ("ct" or "rgb")
         out: Dict[str, str] = {}
-        ent_reg = entity_registry.async_get(self.hass)
-        area_reg = area_registry.async_get(self.hass)
 
         def allowed(ent_id: str) -> bool:
             if ent_id in self.settings.exclude_entities:
