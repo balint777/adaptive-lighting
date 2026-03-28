@@ -123,7 +123,10 @@ class AdaptiveController:
             return
 
         async with self._apply_all_lock:
-            await self._run_apply_all()
+            try:
+                await self._run_apply_all()
+            except Exception:
+                _LOGGER.exception("Unexpected error in periodic adaptive update cycle")
 
     async def _run_apply_all(self) -> None:
         """Execute one periodic adaptive cycle."""
@@ -157,6 +160,11 @@ class AdaptiveController:
         state = self.hass.states.get(ent_id)
         if not state or state.state != "on":
             return False
+
+        # Self-heal stale cancellation flag if an "on" event was missed.
+        if ent_id in self._cancelled_entities:
+            self._cancelled_entities.discard(ent_id)
+
         if ent_id in self._manual_hold_entities:
             return False
         if ent_id in self._pending_tasks:
@@ -232,39 +240,42 @@ class AdaptiveController:
     @callback
     def _handle_light_turn_on(self, event: Event) -> None:
         """Handle state change events for manual hold detection and turn-on control."""
-        if not self._enabled:
-            return
+        try:
+            if not self._enabled:
+                return
 
-        event_data = event.data
-        entity_id = event_data.get("entity_id")
-        old_state = event_data.get("old_state")
-        new_state = event_data.get("new_state")
+            event_data = event.data
+            entity_id = event_data.get("entity_id")
+            old_state = event_data.get("old_state")
+            new_state = event_data.get("new_state")
 
-        if not entity_id or not entity_id.startswith("light.") or not new_state:
-            return
+            if not entity_id or not entity_id.startswith("light.") or not new_state:
+                return
 
-        # Check if this light is a valid target
-        targets = self._get_targets_cached()
-        if entity_id not in targets:
-            # Light capabilities can change at runtime; refresh once to avoid stale misses.
-            self._invalidate_targets_cache()
+            # Check if this light is a valid target
             targets = self._get_targets_cached()
             if entity_id not in targets:
+                # Light capabilities can change at runtime; refresh once to avoid stale misses.
+                self._invalidate_targets_cache()
+                targets = self._get_targets_cached()
+                if entity_id not in targets:
+                    return
+
+            # Handle turn-off events - cancel any pending operations
+            if new_state.state == "off" and old_state and old_state.state == "on":
+                self._handle_turn_off(entity_id)
                 return
-        
-        # Handle turn-off events - cancel any pending operations
-        if new_state.state == "off" and old_state and old_state.state == "on":
-            self._handle_turn_off(entity_id)
-            return
 
-        # Handle turn-on events
-        if new_state.state == "on" and (not old_state or old_state.state != "on"):
-            self._handle_turn_on(entity_id, targets[entity_id])
-            return
+            # Handle turn-on events
+            if new_state.state == "on" and (not old_state or old_state.state != "on"):
+                self._handle_turn_on(entity_id, targets[entity_id])
+                return
 
-        # Handle manual adjustments (only for lights that are on)
-        if new_state.state == "on" and old_state and old_state.state == "on":
-            self._handle_manual_adjustment(entity_id, old_state, new_state)
+            # Handle manual adjustments (only for lights that are on)
+            if new_state.state == "on" and old_state and old_state.state == "on":
+                self._handle_manual_adjustment(entity_id, old_state, new_state)
+        except Exception:
+            _LOGGER.debug("Ignoring malformed light state-change event", exc_info=True)
 
     # --------------------------- helpers ----------------------------------
     def _clear_expired_holds(self) -> None:
@@ -296,6 +307,9 @@ class AdaptiveController:
         ]
         for ent_id in stale_service_logs:
             self._last_service_error_log_at.pop(ent_id, None)
+
+        existing_lights = {state.entity_id for state in self.hass.states.async_all("light")}
+        self._cancelled_entities.intersection_update(existing_lights)
 
     def _get_targets_cached(self) -> Dict[str, str]:
         """Return cached light targets, refreshing periodically."""
