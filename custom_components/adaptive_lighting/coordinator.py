@@ -340,11 +340,18 @@ class AdaptiveController:
 
     def _track_entity_task(self, entity_id: str, coro) -> asyncio.Task:
         """Create and track an entity task with uniform cleanup/exception handling."""
+        existing = self._pending_tasks.get(entity_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
         task = self.hass.async_create_task(coro)
         self._pending_tasks[entity_id] = task
 
         def cleanup(done_task: asyncio.Task) -> None:
-            self._pending_tasks.pop(entity_id, None)
+            # Only clear mapping when this exact task is still the active one.
+            # A newer task may have replaced it for the same entity.
+            if self._pending_tasks.get(entity_id) is done_task:
+                self._pending_tasks.pop(entity_id, None)
             with contextlib.suppress(asyncio.CancelledError):
                 exc = done_task.exception()
                 if exc is not None:
@@ -460,7 +467,10 @@ class AdaptiveController:
         if isinstance(color_modes, set):
             return color_modes
         if isinstance(color_modes, (list, tuple)):
-            return set(color_modes)
+            try:
+                return set(color_modes)
+            except TypeError:
+                return set()
         if isinstance(color_modes, str):
             return {color_modes}
         return set()
@@ -494,9 +504,12 @@ class AdaptiveController:
     def _discover_targets(self) -> Dict[str, str]:
         # Return mapping entity_id -> mode ("ct" or "rgb")
         out: Dict[str, str] = {}
+        excluded = {
+            ent_id for ent_id in self.settings.exclude_entities if isinstance(ent_id, str)
+        }
 
         def allowed(ent_id: str) -> bool:
-            if ent_id in self.settings.exclude_entities:
+            if ent_id in excluded:
                 return False
             return True
 
