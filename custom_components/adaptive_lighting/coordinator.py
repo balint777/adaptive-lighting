@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import contextlib
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -10,17 +12,16 @@ from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
-from .const import (
-    CONF_NIGHT_START,
-    CONF_NIGHT_END,
-    CONF_EXCLUDE_ENTITIES,
-    DEFAULT_NIGHT_START,
-    DEFAULT_NIGHT_END
-)
+from .const import DEFAULT_NIGHT_START, DEFAULT_NIGHT_END
 from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_transition_period
 
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
+MANUAL_HOLD_SECONDS = 2 * 60 * 60
+AUTOMATION_GRACE_SECONDS = 1
+LIGHT_DOMAIN = "light"
+
+_LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Settings:
@@ -94,6 +95,10 @@ class AdaptiveController:
         if self._event_unsub:
             self._event_unsub()
             self._event_unsub = None
+        for task in self._pending_tasks.values():
+            task.cancel()
+        self._pending_tasks.clear()
+        self._cancelled_entities.clear()
 
     async def _apply_all(self, _now=None):
         if not self._enabled:
@@ -104,11 +109,7 @@ class AdaptiveController:
         brightness, k = self._compute_targets()
         
         # Clear expired manual holds (older than 2 hours)
-        current_time = time.time()
-        expired_holds = [ent_id for ent_id, timestamp in self._manual_hold_entities.items() 
-                        if current_time - timestamp > 7200]  # 2 hours in seconds
-        for ent_id in expired_holds:
-            del self._manual_hold_entities[ent_id]
+        self._clear_expired_holds()
 
         for ent_id, mode in targets.items():
             state = self.hass.states.get(ent_id)
@@ -139,16 +140,14 @@ class AdaptiveController:
         self._last_automation_change[ent_id] = time.time()
             
         # Apply brightness first (blocking to ensure it completes before we can be cancelled)
-        await self.hass.services.async_call(
-            "light",
-            "turn_on",
+        if not await self._safe_turn_on(
+            ent_id,
             {
-                "entity_id": ent_id,
                 "transition": self.settings.transition,
-                "brightness_pct": brightness
+                "brightness_pct": brightness,
             },
-            blocking=True
-        )
+        ):
+            return
         
         # if supported_color_modes == ColorMode.WHITE:
         # return
@@ -176,15 +175,12 @@ class AdaptiveController:
             return
 
         # Apply color/temperature (blocking to ensure it completes)
-        await self.hass.services.async_call(
-            "light",
-            "turn_on",
+        await self._safe_turn_on(
+            ent_id,
             {
-                "entity_id": ent_id,
                 "transition": self.settings.transition,
-                **color_data
+                **color_data,
             },
-            blocking=True
         )
         
         # Record that we made this change
@@ -196,16 +192,12 @@ class AdaptiveController:
         if not self._enabled:
             return
 
-        # Check if this is a light event
         event_data = event.data
         entity_id = event_data.get("entity_id")
         old_state = event_data.get("old_state")
         new_state = event_data.get("new_state")
 
-        if not entity_id or not entity_id.startswith("light."):
-            return
-
-        if not new_state:
+        if not entity_id or not entity_id.startswith("light.") or not new_state:
             return
 
         # Check if this light is a valid target
@@ -215,64 +207,138 @@ class AdaptiveController:
         
         # Handle turn-off events - cancel any pending operations
         if new_state.state == "off" and old_state and old_state.state == "on":
-            # Mark entity as cancelled to prevent any pending service calls
-            self._cancelled_entities.add(entity_id)
-            if entity_id in self._pending_tasks:
-                self._pending_tasks[entity_id].cancel()
-                del self._pending_tasks[entity_id]
-            # Clear manual hold when light is turned off
-            if entity_id in self._manual_hold_entities:
-                del self._manual_hold_entities[entity_id]
+            self._handle_turn_off(entity_id)
             return
 
         # Handle turn-on events
         if new_state.state == "on" and (not old_state or old_state.state != "on"):
-            # Light was turned on - clear manual hold and cancellation flag
-            self._cancelled_entities.discard(entity_id)
-            if entity_id in self._manual_hold_entities:
-                del self._manual_hold_entities[entity_id]
-            # Cancel any pending task for this entity
-            if entity_id in self._pending_tasks:
-                self._pending_tasks[entity_id].cancel()
-                del self._pending_tasks[entity_id]
-
-            # Get current adaptive settings and apply immediately
-            b_pct, k = self._compute_targets()
-            mode = targets[entity_id]
-            
-            # Create and track the task
-            task = asyncio.create_task(self._apply_light_settings(entity_id, mode, b_pct, k))
-            self._pending_tasks[entity_id] = task
-            
-            # Clean up task when done
-            def cleanup(_):
-                if entity_id in self._pending_tasks:
-                    del self._pending_tasks[entity_id]
-            task.add_done_callback(cleanup)
+            self._handle_turn_on(entity_id, targets[entity_id])
             return
 
         # Handle manual adjustments (only for lights that are on)
         if new_state.state == "on" and old_state and old_state.state == "on":
-            # Check if this was a manual change (not from our automation)
-            last_automation = self._last_automation_change.get(entity_id, 0)
-            state_changed = new_state.last_changed.timestamp() if new_state.last_changed else 0
-            
-            # If the change happened after our last automation change, it's likely manual
-            if state_changed > last_automation + 1:  # 1 second grace period
-                # Check if brightness or color actually changed
-                old_attrs = old_state.attributes or {}
-                new_attrs = new_state.attributes or {}
-                
-                brightness_changed = old_attrs.get("brightness") != new_attrs.get("brightness")
-                color_temp_changed = old_attrs.get("color_temp") != new_attrs.get("color_temp")
-                color_temp_kelvin_changed = old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
-                rgb_color_changed = old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
-                
-                if brightness_changed or color_temp_changed or color_temp_kelvin_changed or rgb_color_changed:
-                    # This looks like a manual adjustment - add to manual hold
-                    self._manual_hold_entities[entity_id] = time.time()
+            self._handle_manual_adjustment(entity_id, old_state, new_state)
 
     # --------------------------- helpers ----------------------------------
+    def _clear_expired_holds(self) -> None:
+        """Remove stale manual holds to avoid permanent lockout."""
+        current_time = time.time()
+        expired = [
+            ent_id
+            for ent_id, ts in self._manual_hold_entities.items()
+            if current_time - ts > MANUAL_HOLD_SECONDS
+        ]
+        for ent_id in expired:
+            self._manual_hold_entities.pop(ent_id, None)
+
+    def _cancel_pending_task(self, entity_id: str) -> None:
+        """Cancel and forget a pending task for an entity."""
+        task = self._pending_tasks.pop(entity_id, None)
+        if task is not None:
+            task.cancel()
+
+    def _cancel_entity_processing(self, entity_id: str) -> None:
+        """Cancel all pending processing for the entity."""
+        self._cancelled_entities.add(entity_id)
+        self._cancel_pending_task(entity_id)
+
+    def _handle_turn_off(self, entity_id: str) -> None:
+        """Handle entity turn-off transitions."""
+        self._cancel_entity_processing(entity_id)
+        self._manual_hold_entities.pop(entity_id, None)
+
+    def _handle_turn_on(self, entity_id: str, mode: str) -> None:
+        """Handle entity turn-on transitions."""
+        self._cancelled_entities.discard(entity_id)
+        self._manual_hold_entities.pop(entity_id, None)
+        self._cancel_pending_task(entity_id)
+
+        b_pct, k = self._compute_targets()
+        task = self.hass.async_create_task(
+            self._apply_light_settings(entity_id, mode, b_pct, k)
+        )
+        self._pending_tasks[entity_id] = task
+
+        def cleanup(done_task: asyncio.Task) -> None:
+            self._pending_tasks.pop(entity_id, None)
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = done_task.exception()
+                if exc is not None:
+                    _LOGGER.debug("Adaptive task failed for %s: %s", entity_id, exc)
+
+        task.add_done_callback(cleanup)
+
+    def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:
+        """Track manual user adjustments and hold adaptive updates temporarily."""
+        last_automation = self._last_automation_change.get(entity_id, 0)
+        state_changed = new_state.last_changed.timestamp() if new_state.last_changed else 0
+        if state_changed <= last_automation + AUTOMATION_GRACE_SECONDS:
+            return
+
+        old_attrs = old_state.attributes or {}
+        new_attrs = new_state.attributes or {}
+        if (
+            old_attrs.get("brightness") != new_attrs.get("brightness")
+            or old_attrs.get("color_temp") != new_attrs.get("color_temp")
+            or old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
+            or old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
+        ):
+            self._manual_hold_entities[entity_id] = time.time()
+
+    async def _safe_turn_on(self, ent_id: str, service_data: dict) -> bool:
+        """Call light.turn_on safely and report failures without breaking loop."""
+        try:
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN,
+                "turn_on",
+                {
+                    "entity_id": ent_id,
+                    **service_data,
+                },
+                blocking=True,
+            )
+            return True
+        except Exception:
+            _LOGGER.debug("Service call failed for %s with payload %s", ent_id, service_data, exc_info=True)
+            return False
+
+    @staticmethod
+    def _normalize_modes(color_modes: object) -> Set[str]:
+        """Normalize color_modes from integrations to a set of mode strings."""
+        if isinstance(color_modes, set):
+            return color_modes
+        if isinstance(color_modes, (list, tuple)):
+            return set(color_modes)
+        if isinstance(color_modes, str):
+            return {color_modes}
+        return set()
+
+    @staticmethod
+    def _classify_light_mode(attrs: dict, modes: Set[str]) -> str | None:
+        """Return light mode to control or None if unsupported."""
+        has_brightness = (
+            "brightness" in attrs
+            or "brightness" in modes
+            or any(m in modes for m in ("color_temp", *RGB_LIKE_MODES, "white"))
+        )
+        if not has_brightness:
+            return None
+
+        supports_ct = (
+            "color_temp" in modes
+            or "color_temp" in attrs
+            or "color_temp_kelvin" in attrs
+            or "min_color_temp_kelvin" in attrs
+            or "max_color_temp_kelvin" in attrs
+        )
+        if supports_ct:
+            return "ct"
+
+        if any(m in modes for m in RGB_LIKE_MODES):
+            return "rgb"
+
+        return "brightness"
+
     def _discover_targets(self) -> Dict[str, str]:
         # Return mapping entity_id -> mode ("ct" or "rgb")
         out: Dict[str, str] = {}
@@ -292,41 +358,11 @@ class AdaptiveController:
                 if key in attrs:
                     color_modes = attrs.get(key)
                     break
-            # Normalize
-            if isinstance(color_modes, set):
-                modes = color_modes
-            elif isinstance(color_modes, list):
-                modes = set(color_modes)
-            elif isinstance(color_modes, tuple):
-                modes = set(color_modes)
-            elif isinstance(color_modes, str):
-                modes = {color_modes}
-            else:
-                modes = set()
+            modes = self._normalize_modes(color_modes)
 
-            # Newer HA/device stacks can expose capabilities via multiple attrs/modes.
-            has_brightness = (
-                "brightness" in attrs
-                or "brightness" in modes
-                or any(m in modes for m in ("color_temp", *RGB_LIKE_MODES, "white"))
-            )
-            supports_ct = (
-                "color_temp" in modes
-                or "color_temp" in attrs
-                or "color_temp_kelvin" in attrs
-                or "min_color_temp_kelvin" in attrs
-                or "max_color_temp_kelvin" in attrs
-            )
-            supports_rgb = any(m in modes for m in RGB_LIKE_MODES)
-
-            if not has_brightness:
-                continue
-            if supports_ct:
-                out[ent_id] = "ct"
-            elif supports_rgb:
-                out[ent_id] = "rgb"
-            else:
-                out[ent_id] = "brightness"
+            mode = self._classify_light_mode(attrs, modes)
+            if mode is not None:
+                out[ent_id] = mode
         return out
 
     def _compute_targets(self):

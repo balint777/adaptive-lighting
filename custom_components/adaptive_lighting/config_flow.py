@@ -1,9 +1,18 @@
 from __future__ import annotations
 from typing import Any
+
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import callback
 from homeassistant.helpers import selector
-from .const import DOMAIN
+
+from .const import (
+    CONF_EXCLUDE_ENTITIES,
+    CONF_NIGHT_END,
+    CONF_NIGHT_START,
+    DEFAULT_NIGHT_END,
+    DEFAULT_NIGHT_START,
+    DOMAIN,
+)
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -22,9 +31,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _schema(self):
         import voluptuous as vol
         return vol.Schema({
-            vol.Optional("wind_down_target", default="22:00"): selector.selector({"time": {}}),
-            vol.Optional("wake_up", default="06:30"): selector.selector({"time": {}}),
-            vol.Optional("exclude_entities"): selector.selector({"entity": {"domain": "light", "multiple": True}}),
+            vol.Optional(CONF_NIGHT_START, default=DEFAULT_NIGHT_START): selector.selector({"time": {}}),
+            vol.Optional(CONF_NIGHT_END, default=DEFAULT_NIGHT_END): selector.selector({"time": {}}),
+            vol.Optional(CONF_EXCLUDE_ENTITIES, default=[]): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })
 
     async def async_step_import(self, user_input: dict[str, Any] | None = None):
@@ -49,10 +58,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     @callback
     def _schema(self):
         import voluptuous as vol
-        from homeassistant.helpers import selector
         o = self._config_entry.options
         return vol.Schema({
-            vol.Optional("wind_down_target", default=o.get("wind_down_target", "22:00")): selector.selector({"time": {}}),
-            vol.Optional("wake_up", default=o.get("wake_up", "06:30")): selector.selector({"time": {}}),
-            vol.Optional("exclude_entities", default=o.get("exclude_entities", [])): selector.selector({"entity": {"domain": "light", "multiple": True}}),
+            vol.Optional(CONF_NIGHT_START, default=o.get(CONF_NIGHT_START, DEFAULT_NIGHT_START)): selector.selector({"time": {}}),
+            vol.Optional(CONF_NIGHT_END, default=o.get(CONF_NIGHT_END, DEFAULT_NIGHT_END)): selector.selector({"time": {}}),
+            vol.Optional(CONF_EXCLUDE_ENTITIES, default=o.get(CONF_EXCLUDE_ENTITIES, [])): selector.selector({"entity": {"domain": "light", "multiple": True}}),
         })

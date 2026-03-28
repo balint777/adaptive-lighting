@@ -1,21 +1,50 @@
 from __future__ import annotations
+import logging
+
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from .const import DOMAIN, PLATFORMS
+
+from .const import (
+    CONF_EXCLUDE_ENTITIES,
+    CONF_NIGHT_END,
+    CONF_NIGHT_START,
+    DEFAULT_NIGHT_END,
+    DEFAULT_NIGHT_START,
+    DOMAIN,
+    PLATFORMS,
+)
 from .coordinator import AdaptiveController, Settings
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    s = Settings(
-        wind_down_target=entry.options.get("wind_down_target", entry.data.get("wind_down_target", "22:00")),
-        wake_up=entry.options.get("wake_up", entry.data.get("wake_up", "06:30")),
-        exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
+_LOGGER = logging.getLogger(__name__)
+
+
+def _settings_from_entry(entry: ConfigEntry) -> Settings:
+    """Build controller settings from entry options/data."""
+    return Settings(
+        wind_down_target=entry.options.get(
+            CONF_NIGHT_START, entry.data.get(CONF_NIGHT_START, DEFAULT_NIGHT_START)
+        ),
+        wake_up=entry.options.get(
+            CONF_NIGHT_END, entry.data.get(CONF_NIGHT_END, DEFAULT_NIGHT_END)
+        ),
+        exclude_entities=entry.options.get(
+            CONF_EXCLUDE_ENTITIES, entry.data.get(CONF_EXCLUDE_ENTITIES, [])
+        ),
     )
 
-    controller = AdaptiveController(hass, s)
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    controller = AdaptiveController(hass, _settings_from_entry(entry))
     controller.start()
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data[entry.entry_id] = controller
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = controller
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        _LOGGER.exception("Failed to set up Adaptive Lighting platforms")
+        controller.stop()
+        domain_data.pop(entry.entry_id, None)
+        raise
     
     # Set up options update listener
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
@@ -26,17 +55,14 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update settings when options are changed."""
     controller: AdaptiveController = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if controller:
-        # Create new settings object
-        s = Settings(
-            wind_down_target=entry.options.get("wind_down_target", entry.data.get("wind_down_target", "22:00")),
-            wake_up=entry.options.get("wake_up", entry.data.get("wake_up", "06:30")),
-            exclude_entities=entry.options.get("exclude_entities", entry.data.get("exclude_entities", [])),
-        )
-        # Update settings without full restart
-        controller.update_settings(s)
+        controller.update_settings(_settings_from_entry(entry))
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    controller: AdaptiveController = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    domain_data = hass.data.get(DOMAIN, {})
+    controller: AdaptiveController = domain_data.pop(entry.entry_id, None)
     if controller:
         controller.stop()
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not domain_data:
+        hass.data.pop(DOMAIN, None)
+    return unload_ok

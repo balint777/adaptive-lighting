@@ -1,11 +1,13 @@
-DOMAIN = "adaptive_lighting"
-PLATFORMS = ["switch"]
+from typing import Final
+
+DOMAIN: Final = "adaptive_lighting"
+PLATFORMS: Final[list[str]] = ["switch"]
 
 # Defaults
-DEFAULT_NIGHT_START = "22:00"
-DEFAULT_NIGHT_END = "06:30"
+DEFAULT_NIGHT_START: Final = "22:00"
+DEFAULT_NIGHT_END: Final = "06:30"
 
 # Options keys
-CONF_NIGHT_START = "wind_down_target"
-CONF_NIGHT_END = "wake_up"
-CONF_EXCLUDE_ENTITIES = "exclude_entities"
+CONF_NIGHT_START: Final = "wind_down_target"
+CONF_NIGHT_END: Final = "wake_up"
+CONF_EXCLUDE_ENTITIES: Final = "exclude_entities"
