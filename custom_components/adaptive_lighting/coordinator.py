@@ -162,7 +162,7 @@ class AdaptiveController:
     def _is_entity_eligible_for_periodic_update(self, ent_id: str) -> bool:
         """Return whether an entity should receive periodic adaptive updates."""
         state = self.hass.states.get(ent_id)
-        if not state or state.state != "on":
+        if not state or not self._is_state_on(state):
             return False
 
         # Self-heal stale cancellation flag if an "on" event was missed.
@@ -188,7 +188,7 @@ class AdaptiveController:
         
         # Check light state before applying settings
         state = self.hass.states.get(ent_id)
-        if not state or state.state != "on":
+        if not state or not self._is_state_on(state):
             return
 
         # Record timestamp before making changes
@@ -226,7 +226,7 @@ class AdaptiveController:
             return
 
         state = self.hass.states.get(ent_id)
-        if not state or state.state != "on":
+        if not state or not self._is_state_on(state):
             return
 
         # Apply color/temperature (blocking to ensure it completes)
@@ -256,6 +256,12 @@ class AdaptiveController:
             if not entity_id or not entity_id.startswith("light.") or not new_state:
                 return
 
+            new_state_value = getattr(new_state, "state", None)
+            if not isinstance(new_state_value, str):
+                return
+
+            old_state_value = getattr(old_state, "state", None) if old_state is not None else None
+
             # Check if this light is a valid target
             targets = self._get_targets_cached()
             if entity_id not in targets:
@@ -266,17 +272,17 @@ class AdaptiveController:
                     return
 
             # Handle turn-off events - cancel any pending operations
-            if new_state.state == "off" and old_state and old_state.state == "on":
+            if new_state_value == "off" and old_state_value == "on":
                 self._handle_turn_off(entity_id)
                 return
 
             # Handle turn-on events
-            if new_state.state == "on" and (not old_state or old_state.state != "on"):
+            if new_state_value == "on" and old_state_value != "on":
                 self._handle_turn_on(entity_id, targets[entity_id])
                 return
 
             # Handle manual adjustments (only for lights that are on)
-            if new_state.state == "on" and old_state and old_state.state == "on":
+            if new_state_value == "on" and old_state_value == "on":
                 self._handle_manual_adjustment(entity_id, old_state, new_state)
         except Exception:
             _LOGGER.debug("Ignoring malformed light state-change event", exc_info=True)
@@ -388,12 +394,15 @@ class AdaptiveController:
         last_automation = self._last_automation_change.get(entity_id, 0)
         # last_changed only updates when state changes (on/off). For brightness/color
         # adjustments we must use last_updated to detect attribute-only manual changes.
-        state_updated = new_state.last_updated.timestamp() if new_state.last_updated else 0
+        last_updated = getattr(new_state, "last_updated", None)
+        if last_updated is None or not hasattr(last_updated, "timestamp"):
+            return
+        state_updated = last_updated.timestamp()
         if state_updated <= last_automation + AUTOMATION_GRACE_SECONDS:
             return
 
-        old_attrs = old_state.attributes or {}
-        new_attrs = new_state.attributes or {}
+        old_attrs = self._state_attributes(old_state)
+        new_attrs = self._state_attributes(new_state)
         if (
             old_attrs.get("brightness") != new_attrs.get("brightness")
             or old_attrs.get("color_temp") != new_attrs.get("color_temp")
@@ -401,6 +410,17 @@ class AdaptiveController:
             or old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
         ):
             self._manual_hold_entities[entity_id] = time.monotonic()
+
+    @staticmethod
+    def _is_state_on(state) -> bool:
+        """Safely determine whether a Home Assistant state object is 'on'."""
+        return getattr(state, "state", None) == "on"
+
+    @staticmethod
+    def _state_attributes(state) -> dict:
+        """Safely read state attributes as a dict."""
+        attrs = getattr(state, "attributes", None)
+        return attrs if isinstance(attrs, dict) else {}
 
     def _safe_parse_time(self, value: str, fallback: str, field_name: str):
         """Parse a time string with fallback and throttled warning on invalid value."""
