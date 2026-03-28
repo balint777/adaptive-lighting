@@ -36,6 +36,19 @@ class Settings:
     wake_up: str = DEFAULT_NIGHT_END
     exclude_entities: List[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """Normalize potentially malformed persisted config values."""
+        if not isinstance(self.wind_down_target, str) or not self.wind_down_target:
+            self.wind_down_target = DEFAULT_NIGHT_START
+        if not isinstance(self.wake_up, str) or not self.wake_up:
+            self.wake_up = DEFAULT_NIGHT_END
+        if not isinstance(self.exclude_entities, list):
+            self.exclude_entities = []
+        else:
+            self.exclude_entities = [
+                ent_id for ent_id in self.exclude_entities if isinstance(ent_id, str)
+            ]
+
     # Hardcoded values (not configurable by user)
     @property
     def interval(self) -> int:
@@ -194,6 +207,8 @@ class AdaptiveController:
         if not self._enabled:
             return
 
+        transition_seconds = self._safe_transition_seconds()
+
         # Check if cancelled before starting
         if ent_id in self._cancelled_entities:
             return
@@ -210,7 +225,7 @@ class AdaptiveController:
         if not await self._safe_turn_on(
             ent_id,
             {
-                "transition": self.settings.transition,
+                "transition": transition_seconds,
                 "brightness_pct": brightness,
             },
         ):
@@ -220,7 +235,7 @@ class AdaptiveController:
         # return
 
         # Wait for transition to complete
-        await asyncio.sleep(self.settings.transition)
+        await asyncio.sleep(transition_seconds)
 
         if not self._enabled:
             return
@@ -248,7 +263,7 @@ class AdaptiveController:
         await self._safe_turn_on(
             ent_id,
             {
-                "transition": self.settings.transition,
+                "transition": transition_seconds,
                 **color_data,
             },
         )
@@ -412,7 +427,10 @@ class AdaptiveController:
         last_updated = getattr(new_state, "last_updated", None)
         if last_updated is None or not hasattr(last_updated, "timestamp"):
             return
-        state_updated = last_updated.timestamp()
+        try:
+            state_updated = float(last_updated.timestamp())
+        except (TypeError, ValueError, OverflowError):
+            return
         if state_updated <= last_automation + AUTOMATION_GRACE_SECONDS:
             return
 
@@ -436,6 +454,13 @@ class AdaptiveController:
         """Safely read state attributes as a dict."""
         attrs = getattr(state, "attributes", None)
         return attrs if isinstance(attrs, dict) else {}
+
+    def _safe_transition_seconds(self) -> int:
+        """Return a bounded transition value that is safe for sleep/service calls."""
+        transition = self.settings.transition
+        if not isinstance(transition, int):
+            return 1
+        return int(clamp(transition, 0, 300))
 
     def _safe_parse_time(self, value: str, fallback: str, field_name: str):
         """Parse a time string with fallback and throttled warning on invalid value."""
