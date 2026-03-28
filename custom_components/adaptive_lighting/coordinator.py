@@ -20,6 +20,8 @@ RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
 MANUAL_HOLD_SECONDS = 2 * 60 * 60
 AUTOMATION_GRACE_SECONDS = 1
 LIGHT_DOMAIN = "light"
+TARGET_CACHE_TTL_SECONDS = 30
+MAX_CONCURRENT_LIGHT_UPDATES = 6
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +61,9 @@ class AdaptiveController:
         self._pending_tasks: Dict[str, asyncio.Task] = {}  # Track pending operations per entity
         self._cancelled_entities: Set[str] = set()  # Entities that should stop processing
         self._enabled = True
+        self._target_cache: Dict[str, str] = {}
+        self._target_cache_expires_at = 0.0
+        self._apply_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LIGHT_UPDATES)
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -69,7 +74,10 @@ class AdaptiveController:
     def update_settings(self, new_settings: Settings) -> None:
         """Update settings without restarting the controller."""
         old_interval = self.settings.interval
+        old_excludes = set(self.settings.exclude_entities)
         self.settings = new_settings
+        if old_excludes != set(new_settings.exclude_entities):
+            self._invalidate_targets_cache()
         
         # If interval changed, restart the timer
         if old_interval != new_settings.interval:
@@ -80,6 +88,7 @@ class AdaptiveController:
 
     def start(self):
         self.stop()
+        self._invalidate_targets_cache()
         interval = timedelta(seconds=self.settings.interval)
         self._unsub = async_track_time_interval(self.hass, self._apply_all, interval)
         
@@ -99,18 +108,20 @@ class AdaptiveController:
             task.cancel()
         self._pending_tasks.clear()
         self._cancelled_entities.clear()
+        self._invalidate_targets_cache()
 
     async def _apply_all(self, _now=None):
         if not self._enabled:
             return
         # Determine targets
-        targets = self._discover_targets()
+        targets = self._get_targets_cached()
         # Determine target CT/brightness from sun/time
         brightness, k = self._compute_targets()
         
         # Clear expired manual holds (older than 2 hours)
         self._clear_expired_holds()
 
+        updates: list[asyncio.Task] = []
         for ent_id, mode in targets.items():
             state = self.hass.states.get(ent_id)
             if not state:
@@ -122,7 +133,18 @@ class AdaptiveController:
             if ent_id in self._manual_hold_entities:
                 continue
 
-            # Apply light settings for periodic updates (not turn-on events)
+            updates.append(
+                self.hass.async_create_task(
+                    self._apply_light_settings_limited(ent_id, mode, brightness, k)
+                )
+            )
+
+        if updates:
+            await asyncio.gather(*updates, return_exceptions=True)
+
+    async def _apply_light_settings_limited(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
+        """Limit concurrent light updates to avoid service-call bursts."""
+        async with self._apply_semaphore:
             await self._apply_light_settings(ent_id, mode, brightness, k)
 
     async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
@@ -201,8 +223,9 @@ class AdaptiveController:
             return
 
         # Check if this light is a valid target
-        targets = self._discover_targets()
+        targets = self._get_targets_cached()
         if entity_id not in targets:
+            self._invalidate_targets_cache()
             return
         
         # Handle turn-off events - cancel any pending operations
@@ -230,6 +253,18 @@ class AdaptiveController:
         ]
         for ent_id in expired:
             self._manual_hold_entities.pop(ent_id, None)
+
+    def _get_targets_cached(self) -> Dict[str, str]:
+        """Return cached light targets, refreshing periodically."""
+        now = time.monotonic()
+        if now >= self._target_cache_expires_at:
+            self._target_cache = self._discover_targets()
+            self._target_cache_expires_at = now + TARGET_CACHE_TTL_SECONDS
+        return self._target_cache
+
+    def _invalidate_targets_cache(self) -> None:
+        """Invalidate target cache so next read performs discovery."""
+        self._target_cache_expires_at = 0.0
 
     def _cancel_pending_task(self, entity_id: str) -> None:
         """Cancel and forget a pending task for an entity."""
