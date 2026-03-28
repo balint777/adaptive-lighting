@@ -74,7 +74,16 @@ class AdaptiveController:
         self._last_config_warning_log_at = 0.0
 
     def set_enabled(self, enabled: bool) -> None:
+        if self._enabled == enabled:
+            return
+
         self._enabled = enabled
+        if not enabled:
+            for entity_id in tuple(self._pending_tasks):
+                self._cancel_pending_task(entity_id)
+            self._cancelled_entities.clear()
+        else:
+            self._invalidate_targets_cache()
 
     def is_enabled(self) -> bool:
         return self._enabled
@@ -182,6 +191,9 @@ class AdaptiveController:
 
     async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
         """Apply brightness and color settings to a specific light entity."""
+        if not self._enabled:
+            return
+
         # Check if cancelled before starting
         if ent_id in self._cancelled_entities:
             return
@@ -209,6 +221,9 @@ class AdaptiveController:
 
         # Wait for transition to complete
         await asyncio.sleep(self.settings.transition)
+
+        if not self._enabled:
+            return
         
         
         # Prepare color data based on mode
@@ -440,6 +455,10 @@ class AdaptiveController:
 
     async def _safe_turn_on(self, ent_id: str, service_data: dict) -> bool:
         """Call light.turn_on safely and report failures without breaking loop."""
+        if getattr(self.hass, "is_stopping", False):
+            _LOGGER.debug("Skipping light.turn_on for %s while Home Assistant is stopping", ent_id)
+            return False
+
         try:
             await asyncio.wait_for(
                 self.hass.services.async_call(
