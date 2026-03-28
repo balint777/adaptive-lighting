@@ -24,6 +24,7 @@ TARGET_CACHE_TTL_SECONDS = 30
 MAX_CONCURRENT_LIGHT_UPDATES = 6
 TRACKING_STALE_SECONDS = 24 * 60 * 60
 SERVICE_ERROR_LOG_INTERVAL_SECONDS = 5 * 60
+CONFIG_WARNING_LOG_INTERVAL_SECONDS = 5 * 60
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class AdaptiveController:
         self._apply_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LIGHT_UPDATES)
         self._apply_all_lock = asyncio.Lock()
         self._last_service_error_log_at: Dict[str, float] = {}
+        self._last_config_warning_log_at = 0.0
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -267,7 +269,7 @@ class AdaptiveController:
     # --------------------------- helpers ----------------------------------
     def _clear_expired_holds(self) -> None:
         """Remove stale manual holds to avoid permanent lockout."""
-        current_time = time.time()
+        current_time = time.monotonic()
         expired = [
             ent_id
             for ent_id, ts in self._manual_hold_entities.items()
@@ -286,6 +288,14 @@ class AdaptiveController:
         ]
         for ent_id in stale:
             self._last_automation_change.pop(ent_id, None)
+
+        stale_service_logs = [
+            ent_id
+            for ent_id, ts in self._last_service_error_log_at.items()
+            if now - ts > TRACKING_STALE_SECONDS
+        ]
+        for ent_id in stale_service_logs:
+            self._last_service_error_log_at.pop(ent_id, None)
 
     def _get_targets_cached(self) -> Dict[str, str]:
         """Return cached light targets, refreshing periodically."""
@@ -341,6 +351,10 @@ class AdaptiveController:
 
     def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:
         """Track manual user adjustments and hold adaptive updates temporarily."""
+        # Ignore updates while we still have an in-flight automation task for this entity.
+        if entity_id in self._pending_tasks:
+            return
+
         last_automation = self._last_automation_change.get(entity_id, 0)
         # last_changed only updates when state changes (on/off). For brightness/color
         # adjustments we must use last_updated to detect attribute-only manual changes.
@@ -356,7 +370,23 @@ class AdaptiveController:
             or old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
             or old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
         ):
-            self._manual_hold_entities[entity_id] = time.time()
+            self._manual_hold_entities[entity_id] = time.monotonic()
+
+    def _safe_parse_time(self, value: str, fallback: str, field_name: str):
+        """Parse a time string with fallback and throttled warning on invalid value."""
+        try:
+            return parse_time_str(value)
+        except (TypeError, ValueError):
+            now = time.time()
+            if now - self._last_config_warning_log_at >= CONFIG_WARNING_LOG_INTERVAL_SECONDS:
+                self._last_config_warning_log_at = now
+                _LOGGER.warning(
+                    "Adaptive Lighting received invalid %s value '%s'; falling back to '%s'",
+                    field_name,
+                    value,
+                    fallback,
+                )
+            return parse_time_str(fallback)
 
     async def _safe_turn_on(self, ent_id: str, service_data: dict) -> bool:
         """Call light.turn_on safely and report failures without breaking loop."""
@@ -450,8 +480,16 @@ class AdaptiveController:
 
     def _compute_targets(self):
         now = dt_util.now().time()
-        wind_down_target = parse_time_str(self.settings.wind_down_target)
-        wake_up = parse_time_str(self.settings.wake_up)
+        wind_down_target = self._safe_parse_time(
+            self.settings.wind_down_target,
+            DEFAULT_NIGHT_START,
+            "wind_down_target",
+        )
+        wake_up = self._safe_parse_time(
+            self.settings.wake_up,
+            DEFAULT_NIGHT_END,
+            "wake_up",
+        )
         
         # Sleep window override
         if in_window(now, wind_down_target, wake_up):
@@ -474,7 +512,10 @@ class AdaptiveController:
         sun = self.hass.states.get("sun.sun")
         elev = -6.0
         if sun:
-            elev = float(sun.attributes.get("elevation", -6.0))
+            try:
+                elev = float(sun.attributes.get("elevation", -6.0))
+            except (TypeError, ValueError):
+                elev = -6.0
 
         tk = clamp((elev + 6.0) / (60.0 + 6.0), 0.0, 1.0)
         k = int(round(lerp(2200, 6500, tk)))
