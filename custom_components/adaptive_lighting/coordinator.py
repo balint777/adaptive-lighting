@@ -22,6 +22,8 @@ AUTOMATION_GRACE_SECONDS = 1
 LIGHT_DOMAIN = "light"
 TARGET_CACHE_TTL_SECONDS = 30
 MAX_CONCURRENT_LIGHT_UPDATES = 6
+TRACKING_STALE_SECONDS = 24 * 60 * 60
+SERVICE_ERROR_LOG_INTERVAL_SECONDS = 5 * 60
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +66,8 @@ class AdaptiveController:
         self._target_cache: Dict[str, str] = {}
         self._target_cache_expires_at = 0.0
         self._apply_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LIGHT_UPDATES)
+        self._apply_all_lock = asyncio.Lock()
+        self._last_service_error_log_at: Dict[str, float] = {}
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -80,11 +84,10 @@ class AdaptiveController:
             self._invalidate_targets_cache()
         
         # If interval changed, restart the timer
-        if old_interval != new_settings.interval:
-            if self._unsub:
-                self._unsub()
-                interval = timedelta(seconds=self.settings.interval)
-                self._unsub = async_track_time_interval(self.hass, self._apply_all, interval)
+        if old_interval != new_settings.interval and self._unsub:
+            self._unsub()
+            interval = timedelta(seconds=self.settings.interval)
+            self._unsub = async_track_time_interval(self.hass, self._apply_all, interval)
 
     def start(self):
         self.stop()
@@ -113,6 +116,15 @@ class AdaptiveController:
     async def _apply_all(self, _now=None):
         if not self._enabled:
             return
+        if self._apply_all_lock.locked():
+            # Skip if previous cycle is still running.
+            return
+
+        async with self._apply_all_lock:
+            await self._run_apply_all()
+
+    async def _run_apply_all(self) -> None:
+        """Execute one periodic adaptive cycle."""
         # Determine targets
         targets = self._get_targets_cached()
         # Determine target CT/brightness from sun/time
@@ -120,27 +132,34 @@ class AdaptiveController:
         
         # Clear expired manual holds (older than 2 hours)
         self._clear_expired_holds()
+        self._clear_stale_tracking()
 
         updates: list[asyncio.Task] = []
         for ent_id, mode in targets.items():
-            state = self.hass.states.get(ent_id)
-            if not state:
-                continue
-            if state.state != "on":
+            if not self._is_entity_eligible_for_periodic_update(ent_id):
                 continue
 
-            # Skip if entity is in manual hold
-            if ent_id in self._manual_hold_entities:
-                continue
-
-            updates.append(
-                self.hass.async_create_task(
-                    self._apply_light_settings_limited(ent_id, mode, brightness, k)
-                )
+            task = self._track_entity_task(
+                ent_id, self._apply_light_settings_limited(ent_id, mode, brightness, k)
             )
+            updates.append(task)
 
         if updates:
-            await asyncio.gather(*updates, return_exceptions=True)
+            results = await asyncio.gather(*updates, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                    _LOGGER.debug("Periodic update task failed: %s", result, exc_info=result)
+
+    def _is_entity_eligible_for_periodic_update(self, ent_id: str) -> bool:
+        """Return whether an entity should receive periodic adaptive updates."""
+        state = self.hass.states.get(ent_id)
+        if not state or state.state != "on":
+            return False
+        if ent_id in self._manual_hold_entities:
+            return False
+        if ent_id in self._pending_tasks:
+            return False
+        return True
 
     async def _apply_light_settings_limited(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
         """Limit concurrent light updates to avoid service-call bursts."""
@@ -225,8 +244,11 @@ class AdaptiveController:
         # Check if this light is a valid target
         targets = self._get_targets_cached()
         if entity_id not in targets:
+            # Light capabilities can change at runtime; refresh once to avoid stale misses.
             self._invalidate_targets_cache()
-            return
+            targets = self._get_targets_cached()
+            if entity_id not in targets:
+                return
         
         # Handle turn-off events - cancel any pending operations
         if new_state.state == "off" and old_state and old_state.state == "on":
@@ -254,13 +276,24 @@ class AdaptiveController:
         for ent_id in expired:
             self._manual_hold_entities.pop(ent_id, None)
 
+    def _clear_stale_tracking(self) -> None:
+        """Prune stale automation timestamps for entities not updated recently."""
+        now = time.time()
+        stale = [
+            ent_id
+            for ent_id, ts in self._last_automation_change.items()
+            if now - ts > TRACKING_STALE_SECONDS
+        ]
+        for ent_id in stale:
+            self._last_automation_change.pop(ent_id, None)
+
     def _get_targets_cached(self) -> Dict[str, str]:
         """Return cached light targets, refreshing periodically."""
         now = time.monotonic()
         if now >= self._target_cache_expires_at:
             self._target_cache = self._discover_targets()
             self._target_cache_expires_at = now + TARGET_CACHE_TTL_SECONDS
-        return self._target_cache
+        return dict(self._target_cache)
 
     def _invalidate_targets_cache(self) -> None:
         """Invalidate target cache so next read performs discovery."""
@@ -271,6 +304,21 @@ class AdaptiveController:
         task = self._pending_tasks.pop(entity_id, None)
         if task is not None:
             task.cancel()
+
+    def _track_entity_task(self, entity_id: str, coro) -> asyncio.Task:
+        """Create and track an entity task with uniform cleanup/exception handling."""
+        task = self.hass.async_create_task(coro)
+        self._pending_tasks[entity_id] = task
+
+        def cleanup(done_task: asyncio.Task) -> None:
+            self._pending_tasks.pop(entity_id, None)
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = done_task.exception()
+                if exc is not None:
+                    _LOGGER.debug("Adaptive task failed for %s: %s", entity_id, exc)
+
+        task.add_done_callback(cleanup)
+        return task
 
     def _cancel_entity_processing(self, entity_id: str) -> None:
         """Cancel all pending processing for the entity."""
@@ -289,19 +337,7 @@ class AdaptiveController:
         self._cancel_pending_task(entity_id)
 
         b_pct, k = self._compute_targets()
-        task = self.hass.async_create_task(
-            self._apply_light_settings(entity_id, mode, b_pct, k)
-        )
-        self._pending_tasks[entity_id] = task
-
-        def cleanup(done_task: asyncio.Task) -> None:
-            self._pending_tasks.pop(entity_id, None)
-            with contextlib.suppress(asyncio.CancelledError):
-                exc = done_task.exception()
-                if exc is not None:
-                    _LOGGER.debug("Adaptive task failed for %s: %s", entity_id, exc)
-
-        task.add_done_callback(cleanup)
+        self._track_entity_task(entity_id, self._apply_light_settings(entity_id, mode, b_pct, k))
 
     def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:
         """Track manual user adjustments and hold adaptive updates temporarily."""
@@ -334,8 +370,18 @@ class AdaptiveController:
                 },
                 blocking=True,
             )
+            self._last_service_error_log_at.pop(ent_id, None)
             return True
-        except Exception:
+        except Exception as err:
+            now = time.time()
+            last_logged = self._last_service_error_log_at.get(ent_id, 0.0)
+            if now - last_logged >= SERVICE_ERROR_LOG_INTERVAL_SECONDS:
+                self._last_service_error_log_at[ent_id] = now
+                _LOGGER.warning(
+                    "Adaptive Lighting failed to update %s (throttled log, retrying automatically): %s",
+                    ent_id,
+                    err,
+                )
             _LOGGER.debug("Service call failed for %s with payload %s", ent_id, service_data, exc_info=True)
             return False
 
