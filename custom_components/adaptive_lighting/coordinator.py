@@ -19,7 +19,7 @@ from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_tran
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
 MANUAL_HOLD_SECONDS = 2 * 60 * 60
-AUTOMATION_GRACE_SECONDS = 1
+AUTOMATION_GRACE_SECONDS = 5
 LIGHT_DOMAIN = "light"
 TARGET_CACHE_TTL_SECONDS = 30
 MAX_CONCURRENT_LIGHT_UPDATES = 6
@@ -431,7 +431,10 @@ class AdaptiveController:
             state_updated = float(last_updated.timestamp())
         except (TypeError, ValueError, OverflowError):
             return
-        if state_updated <= last_automation + AUTOMATION_GRACE_SECONDS:
+        # Grace period accounts for network round-trip delay plus the transition
+        # duration during which the light reports intermediate attribute changes.
+        grace = AUTOMATION_GRACE_SECONDS + self._safe_transition_seconds()
+        if state_updated <= last_automation + grace:
             return
 
         old_attrs = self._state_attributes(old_state)
