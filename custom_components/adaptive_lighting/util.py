@@ -1,6 +1,7 @@
 from __future__ import annotations
+import math
 from datetime import datetime, time, timedelta
-from typing import Iterable, Tuple
+from typing import Tuple
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -53,14 +54,14 @@ def add_hours_to_time(t: time, hours: float) -> time:
     return dt.time()
 
 
-def is_in_transition_period(now_t: time, wind_down_target: time, wake_up: time) -> Tuple[bool, str, float]:
+def is_in_transition_period(now_t: time, wind_down_target: time, wake_up: time) -> Tuple[bool, bool, float]:
     """
     Check if current time is in transition period and return progress.
     
     Returns:
         (is_in_transition, wind_down, progress)
         - is_in_transition: True if in a transition period
-        - wind_down: Boolean
+        - wind_down: True if winding down (pre-night), False if waking up (post-night)
         - progress: 0.0 to 1.0, where 0.0 is start of transition, 1.0 is end
     """
     # Calculate transition windows
@@ -97,7 +98,7 @@ def cct_to_rgb(kelvin: int) -> Tuple[int, int, int]:
         r = 329.698727446 * ((k - 60) ** -0.1332047592)
     # Green
     if k <= 66:
-        g = 99.4708025861 * (k) - 161.1195681661
+        g = 99.4708025861 * math.log(k) - 161.1195681661
     else:
         g = 288.1221695283 * ((k - 60) ** -0.0755148492)
     # Blue
@@ -106,7 +107,7 @@ def cct_to_rgb(kelvin: int) -> Tuple[int, int, int]:
     elif k <= 19:
         b = 0
     else:
-        b = 138.5177312231 * (k - 10) - 305.0447927307
+        b = 138.5177312231 * math.log(k - 10) - 305.0447927307
     return (
         int(clamp(r, 0, 255)),
         int(clamp(g, 0, 255)),
