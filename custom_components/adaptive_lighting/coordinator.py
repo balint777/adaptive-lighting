@@ -4,22 +4,27 @@ import contextlib
 import logging
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Dict, List, Set
+from typing import Awaitable, Callable, Dict, List, Set
 
-from homeassistant.core import HomeAssistant, Event, callback
-from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import Context, HomeAssistant, Event, callback
+from homeassistant.const import EVENT_CALL_SERVICE, EVENT_STATE_CHANGED
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import DEFAULT_NIGHT_START, DEFAULT_NIGHT_END
+from .native import NativeLightController, NativeLightTarget
 from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_transition_period
 
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
 RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
 MANUAL_HOLD_SECONDS = 2 * 60 * 60
 AUTOMATION_GRACE_SECONDS = 5
+TURN_OFF_GUARD_SECONDS = 5
+MIN_SPLIT_COMMAND_DELAY_SECONDS = 0.25
+AUTOMATION_CONTEXT_PREFIX = "adl:"
 LIGHT_DOMAIN = "light"
 TARGET_CACHE_TTL_SECONDS = 30
 MAX_CONCURRENT_LIGHT_UPDATES = 6
@@ -27,6 +32,20 @@ TRACKING_STALE_SECONDS = 24 * 60 * 60
 SERVICE_ERROR_LOG_INTERVAL_SECONDS = 5 * 60
 CONFIG_WARNING_LOG_INTERVAL_SECONDS = 5 * 60
 SERVICE_CALL_TIMEOUT_SECONDS = 15
+NATIVE_BRIGHTNESS_TOLERANCE_PCT = 6.0
+NATIVE_COLOR_TOLERANCE_KELVIN = 200
+LIGHT_ADJUSTMENT_KEYS = {
+    "brightness",
+    "brightness_pct",
+    "color_temp",
+    "color_temp_kelvin",
+    "hs_color",
+    "rgb_color",
+    "rgbw_color",
+    "rgbww_color",
+    "xy_color",
+    "white",
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +86,15 @@ class Settings:
         return 2200 # warm color temperature during sleep
 
 
+@dataclass(frozen=True)
+class NativeExpectedState:
+    """Last brightness/color state requested through a native protocol command."""
+
+    mode: str
+    brightness: int
+    kelvin: int | None
+
+
 
 class AdaptiveController:
     def __init__(self, hass: HomeAssistant, settings: Settings):
@@ -74,8 +102,11 @@ class AdaptiveController:
         self.settings = settings
         self._unsub = None
         self._event_unsub = None  # For event tracking
+        self._service_event_unsub = None  # For observing power commands before state updates
         self._manual_hold_entities: Dict[str, float] = {}  # Entities with manual adjustments (entity_id -> timestamp)
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
+        self._last_turn_off_request: Dict[str, float] = {}
+        self._last_turn_on_request: Dict[str, float] = {}
         self._pending_tasks: Dict[str, asyncio.Task] = {}  # Track pending operations per entity
         self._cancelled_entities: Set[str] = set()  # Entities that should stop processing
         self._enabled = True
@@ -85,6 +116,8 @@ class AdaptiveController:
         self._apply_all_lock = asyncio.Lock()
         self._last_service_error_log_at: Dict[str, float] = {}
         self._last_config_warning_log_at = 0.0
+        self._native_lights = NativeLightController(hass)
+        self._native_expected_states: Dict[str, NativeExpectedState] = {}
 
     def set_enabled(self, enabled: bool) -> None:
         if self._enabled == enabled:
@@ -95,6 +128,7 @@ class AdaptiveController:
             for entity_id in tuple(self._pending_tasks):
                 self._cancel_pending_task(entity_id)
             self._cancelled_entities.clear()
+            self._native_expected_states.clear()
         else:
             self._invalidate_targets_cache()
 
@@ -125,6 +159,12 @@ class AdaptiveController:
         self._event_unsub = self.hass.bus.async_listen(
             EVENT_STATE_CHANGED, self._handle_light_turn_on
         )
+        # State reports can lag behind service calls. Observe power commands as
+        # soon as they are issued so a pending adaptive update cannot race a
+        # user-requested turn-off.
+        self._service_event_unsub = self.hass.bus.async_listen(
+            EVENT_CALL_SERVICE, self._handle_light_service_call
+        )
 
     def stop(self):
         if self._unsub:
@@ -133,10 +173,16 @@ class AdaptiveController:
         if self._event_unsub:
             self._event_unsub()
             self._event_unsub = None
+        if self._service_event_unsub:
+            self._service_event_unsub()
+            self._service_event_unsub = None
         for task in self._pending_tasks.values():
             task.cancel()
         self._pending_tasks.clear()
         self._cancelled_entities.clear()
+        self._last_turn_off_request.clear()
+        self._last_turn_on_request.clear()
+        self._native_expected_states.clear()
         self._invalidate_targets_cache()
 
     async def _apply_all(self, _now=None):
@@ -187,6 +233,9 @@ class AdaptiveController:
         if not state or not self._is_state_on(state):
             return False
 
+        if self._is_guarded_after_turn_off(ent_id):
+            return False
+
         # Self-heal stale cancellation flag if an "on" event was missed.
         if ent_id in self._cancelled_entities:
             self._cancelled_entities.discard(ent_id)
@@ -218,58 +267,180 @@ class AdaptiveController:
         if not state or not self._is_state_on(state):
             return
 
-        # Record timestamp before making changes
-        self._last_automation_change[ent_id] = time.time()
-            
-        # Apply brightness first (blocking to ensure it completes before we can be cancelled)
-        if not await self._safe_turn_on(
-            ent_id,
-            {
-                "transition": transition_seconds,
-                "brightness_pct": brightness,
-            },
-        ):
+        # Matter and ZHA expose protocol commands which change level/color but
+        # not the On/Off state. Prefer those for CT and brightness-only lights.
+        # RGB conversion remains on the generic Home Assistant path.
+        native_target = None
+        if mode in {"ct", "brightness"}:
+            native_target = self._native_lights.resolve(
+                ent_id,
+                require_color_temperature=mode == "ct",
+            )
+        if native_target is not None:
+            await self._apply_native_light_settings(
+                ent_id,
+                mode,
+                brightness,
+                self._clamp_color_temperature(state, k),
+                transition_seconds,
+                native_target,
+            )
             return
-        
-        # if supported_color_modes == ColorMode.WHITE:
-        # return
 
-        # Wait for transition to complete
-        await asyncio.sleep(transition_seconds)
+        # The integration or capabilities may have changed since this entity
+        # last used native commands. Do not apply a stale native expectation to
+        # feedback from the generic Home Assistant service path.
+        self._native_expected_states.pop(ent_id, None)
 
-        if not self._enabled:
-            return
-        
-        
-        # Prepare color data based on mode
+        # Some bulbs discard either brightness or color when both are sent in
+        # one command. Send brightness first, then color after the brightness
+        # transition has settled. Both waits are cancellable, and the service
+        # call listener cancels this sequence as soon as turn_off is requested.
+        brightness_data = {
+            "transition": transition_seconds,
+            "brightness_pct": brightness,
+        }
+        color_data = None
         if mode == "ct":
-            color_data = {"color_temp_kelvin": k}
+            color_data = {
+                "color_temp_kelvin": self._clamp_color_temperature(state, k)
+            }
         elif mode == "rgb":
             r, g, b = cct_to_rgb(k)
             color_data = {"rgb_color": [r, g, b]}
-        else:
-            # Brightness-only light: skip color update.
-            return
-        
-        # Check cancellation and light state before applying color
-        if ent_id in self._cancelled_entities:
+
+        # Record the timestamp immediately before each device write.
+        self._last_automation_change[ent_id] = time.time()
+        if not await self._safe_turn_on(ent_id, brightness_data):
             return
 
+        if color_data is None:
+            self._last_automation_change[ent_id] = time.time()
+            return
+
+        await asyncio.sleep(max(transition_seconds, MIN_SPLIT_COMMAND_DELAY_SECONDS))
+
+        if not self._enabled or ent_id in self._cancelled_entities:
+            return
+        if self._is_guarded_after_turn_off(ent_id):
+            return
         state = self.hass.states.get(ent_id)
         if not state or not self._is_state_on(state):
             return
 
-        # Apply color/temperature (blocking to ensure it completes)
-        await self._safe_turn_on(
+        self._last_automation_change[ent_id] = time.time()
+        if not await self._safe_turn_on(
             ent_id,
-            {
-                "transition": transition_seconds,
-                **color_data,
-            },
-        )
-        
+            {"transition": transition_seconds, **color_data},
+        ):
+            return
+
         # Record that we made this change
         self._last_automation_change[ent_id] = time.time()
+
+    async def _apply_native_light_settings(
+        self,
+        ent_id: str,
+        mode: str,
+        brightness: int,
+        kelvin: int,
+        transition_seconds: int,
+        target: NativeLightTarget,
+    ) -> None:
+        """Apply sequential, power-neutral Matter/Zigbee commands."""
+        # Direct protocol commands do not carry our Home Assistant service
+        # context. Store the intended result before dispatch so synchronous or
+        # delayed device reports can still be identified as our own feedback.
+        self._native_expected_states[ent_id] = NativeExpectedState(
+            mode=mode,
+            brightness=brightness,
+            kelvin=kelvin if mode == "ct" else None,
+        )
+        self._last_automation_change[ent_id] = time.time()
+        if not await self._safe_native_command(
+            ent_id,
+            target.integration,
+            "brightness",
+            lambda: target.async_set_brightness(brightness, transition_seconds),
+        ):
+            # Once a native command is attempted, never switch to light.turn_on
+            # in the same cycle: delivery may have succeeded despite an error.
+            return
+
+        if mode != "ct":
+            self._last_automation_change[ent_id] = time.time()
+            return
+
+        await asyncio.sleep(max(transition_seconds, MIN_SPLIT_COMMAND_DELAY_SECONDS))
+
+        if not self._can_continue_light_update(ent_id):
+            return
+
+        self._last_automation_change[ent_id] = time.time()
+        if not await self._safe_native_command(
+            ent_id,
+            target.integration,
+            "color temperature",
+            lambda: target.async_set_color_temperature(kelvin, transition_seconds),
+        ):
+            return
+
+        self._last_automation_change[ent_id] = time.time()
+
+    @callback
+    def _handle_light_service_call(self, event: Event) -> None:
+        """Observe light power intent before potentially delayed state updates."""
+        try:
+            if not self._enabled or event.data.get("domain") != LIGHT_DOMAIN:
+                return
+            context_id = getattr(event.context, "id", "")
+            if isinstance(context_id, str) and context_id.startswith(AUTOMATION_CONTEXT_PREFIX):
+                return
+
+            service = event.data.get("service")
+            if service not in {"turn_on", "turn_off", "toggle"}:
+                return
+
+            service_data = event.data.get("service_data")
+            if not isinstance(service_data, Mapping):
+                return
+
+            entity_ids = self._extract_light_entity_ids(service_data)
+            if not entity_ids:
+                return
+
+            targets = self._get_targets_cached()
+            now = time.monotonic()
+            for entity_id in entity_ids:
+                if entity_id not in targets:
+                    continue
+
+                state = self.hass.states.get(entity_id)
+                if (
+                    service == "turn_on"
+                    and state is not None
+                    and self._is_state_on(state)
+                    and any(key in service_data for key in LIGHT_ADJUSTMENT_KEYS)
+                ):
+                    # Explicit brightness/color service data is reliable manual
+                    # intent even if its resulting state is close to our target.
+                    self._set_manual_hold(entity_id)
+                    continue
+
+                is_turning_off = service == "turn_off"
+                if service == "toggle":
+                    is_turning_off = state is not None and self._is_state_on(state)
+
+                if is_turning_off:
+                    self._last_turn_off_request[entity_id] = now
+                    self._cancel_entity_processing(entity_id)
+                    self._manual_hold_entities.pop(entity_id, None)
+                    self._native_expected_states.pop(entity_id, None)
+                else:
+                    self._last_turn_on_request[entity_id] = now
+                    self._cancelled_entities.discard(entity_id)
+        except Exception:
+            _LOGGER.debug("Ignoring malformed light service-call event", exc_info=True)
 
     @callback
     def _handle_light_turn_on(self, event: Event) -> None:
@@ -332,6 +503,7 @@ class AdaptiveController:
     def _clear_stale_tracking(self) -> None:
         """Prune stale automation timestamps for entities not updated recently."""
         now = time.time()
+        monotonic_now = time.monotonic()
         existing_lights = {state.entity_id for state in self.hass.states.async_all("light")}
 
         for ent_id in tuple(self._manual_hold_entities):
@@ -353,6 +525,19 @@ class AdaptiveController:
         ]
         for ent_id in stale_service_logs:
             self._last_service_error_log_at.pop(ent_id, None)
+
+        for ent_id in tuple(self._native_expected_states):
+            if ent_id not in existing_lights:
+                self._native_expected_states.pop(ent_id, None)
+
+        for tracking in (self._last_turn_off_request, self._last_turn_on_request):
+            stale_requests = [
+                ent_id
+                for ent_id, ts in tracking.items()
+                if monotonic_now - ts > TRACKING_STALE_SECONDS or ent_id not in existing_lights
+            ]
+            for ent_id in stale_requests:
+                tracking.pop(ent_id, None)
 
         self._cancelled_entities.intersection_update(existing_lights)
 
@@ -403,11 +588,27 @@ class AdaptiveController:
 
     def _handle_turn_off(self, entity_id: str) -> None:
         """Handle entity turn-off transitions."""
+        now = time.monotonic()
+        last_turn_on = self._last_turn_on_request.get(entity_id, 0.0)
+        last_turn_off = self._last_turn_off_request.get(entity_id, 0.0)
+        # A delayed state report for an earlier off command must not override a
+        # newer explicit on command. Physical/off state changes still establish
+        # a guard when there is no recent newer turn-on request.
+        if last_turn_on <= last_turn_off or now - last_turn_on >= TURN_OFF_GUARD_SECONDS:
+            self._last_turn_off_request[entity_id] = now
         self._cancel_entity_processing(entity_id)
         self._manual_hold_entities.pop(entity_id, None)
+        self._native_expected_states.pop(entity_id, None)
 
     def _handle_turn_on(self, entity_id: str, mode: str) -> None:
         """Handle entity turn-on transitions."""
+        # A device or integration may briefly report "on" while a turn-off is
+        # still settling. Do not interpret that state bounce as a new request
+        # to power the light. An explicit later turn_on request bypasses this
+        # guard immediately.
+        if self._is_guarded_after_turn_off(entity_id):
+            return
+
         self._cancelled_entities.discard(entity_id)
         self._manual_hold_entities.pop(entity_id, None)
         self._cancel_pending_task(entity_id)
@@ -419,6 +620,17 @@ class AdaptiveController:
         """Track manual user adjustments and hold adaptive updates temporarily."""
         # Ignore updates while we still have an in-flight automation task for this entity.
         if entity_id in self._pending_tasks:
+            return
+
+        old_attrs = self._state_attributes(old_state)
+        new_attrs = self._state_attributes(new_state)
+        if not self._adaptive_attributes_changed(old_attrs, new_attrs):
+            return
+
+        # Native protocol writes have no light-service context and device
+        # reports can arrive well after the command task has completed. Match
+        # those reports by value instead of treating them as manual changes.
+        if self._matches_native_expectation(entity_id, old_attrs, new_attrs):
             return
 
         last_automation = self._last_automation_change.get(entity_id, 0)
@@ -437,15 +649,85 @@ class AdaptiveController:
         if state_updated <= last_automation + grace:
             return
 
-        old_attrs = self._state_attributes(old_state)
-        new_attrs = self._state_attributes(new_state)
-        if (
+        self._set_manual_hold(entity_id)
+
+    def _set_manual_hold(self, entity_id: str) -> None:
+        """Suspend adaptation after confirmed manual brightness/color intent."""
+        self._manual_hold_entities[entity_id] = time.monotonic()
+        self._native_expected_states.pop(entity_id, None)
+        self._cancel_pending_task(entity_id)
+
+    @staticmethod
+    def _adaptive_attributes_changed(old_attrs: dict, new_attrs: dict) -> bool:
+        """Return whether brightness or a controlled color attribute changed."""
+        return (
             old_attrs.get("brightness") != new_attrs.get("brightness")
             or old_attrs.get("color_temp") != new_attrs.get("color_temp")
-            or old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
+            or old_attrs.get("color_temp_kelvin")
+            != new_attrs.get("color_temp_kelvin")
             or old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
-        ):
-            self._manual_hold_entities[entity_id] = time.monotonic()
+        )
+
+    def _matches_native_expectation(
+        self, entity_id: str, old_attrs: dict, new_attrs: dict
+    ) -> bool:
+        """Return whether changed attributes match our last native command."""
+        expected = self._native_expected_states.get(entity_id)
+        if expected is None:
+            return False
+
+        matched_change = False
+        if old_attrs.get("brightness") != new_attrs.get("brightness"):
+            brightness = new_attrs.get("brightness")
+            try:
+                brightness_pct = float(brightness) * 100 / 255
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                abs(brightness_pct - expected.brightness)
+                > NATIVE_BRIGHTNESS_TOLERANCE_PCT
+            ):
+                return False
+            matched_change = True
+
+        color_changed = (
+            old_attrs.get("color_temp") != new_attrs.get("color_temp")
+            or old_attrs.get("color_temp_kelvin")
+            != new_attrs.get("color_temp_kelvin")
+        )
+        if color_changed:
+            if expected.mode != "ct" or expected.kelvin is None:
+                return False
+            kelvin = self._reported_color_temperature_kelvin(new_attrs)
+            if kelvin is None:
+                return False
+            if abs(kelvin - expected.kelvin) > NATIVE_COLOR_TOLERANCE_KELVIN:
+                return False
+            matched_change = True
+
+        rgb_changed = old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
+        if rgb_changed and not (expected.mode == "ct" and color_changed):
+            return False
+
+        return matched_change
+
+    @staticmethod
+    def _reported_color_temperature_kelvin(attrs: dict) -> float | None:
+        """Read a reported color temperature in Kelvin from HA attributes."""
+        kelvin = attrs.get("color_temp_kelvin")
+        if kelvin is not None:
+            try:
+                return float(kelvin)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        mireds = attrs.get("color_temp")
+        if mireds is None:
+            return None
+        try:
+            return 1_000_000 / float(mireds)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return None
 
     @staticmethod
     def _is_state_on(state) -> bool:
@@ -481,12 +763,74 @@ class AdaptiveController:
                 )
             return parse_time_str(fallback)
 
+    def _is_guarded_after_turn_off(self, entity_id: str) -> bool:
+        """Return whether a recent off request still owns the power intent."""
+        turned_off_at = self._last_turn_off_request.get(entity_id)
+        if turned_off_at is None:
+            return False
+        if self._last_turn_on_request.get(entity_id, 0.0) > turned_off_at:
+            return False
+        return time.monotonic() - turned_off_at < TURN_OFF_GUARD_SECONDS
+
+    def _can_continue_light_update(self, entity_id: str) -> bool:
+        """Return whether a split light update may send its next command."""
+        if not self._enabled or entity_id in self._cancelled_entities:
+            return False
+        if self._is_guarded_after_turn_off(entity_id):
+            return False
+        state = self.hass.states.get(entity_id)
+        return state is not None and self._is_state_on(state)
+
+    def _extract_light_entity_ids(self, service_data: Mapping) -> Set[str]:
+        """Extract direct light targets and members of light groups."""
+        raw_entity_ids = service_data.get("entity_id")
+        if isinstance(raw_entity_ids, str):
+            pending = [part.strip() for part in raw_entity_ids.split(",")]
+        elif isinstance(raw_entity_ids, (list, tuple, set)):
+            pending = [item for item in raw_entity_ids if isinstance(item, str)]
+        else:
+            return set()
+
+        entity_ids: Set[str] = set()
+        while pending:
+            entity_id = pending.pop()
+            if not entity_id.startswith(f"{LIGHT_DOMAIN}.") or entity_id in entity_ids:
+                continue
+            entity_ids.add(entity_id)
+
+            state = self.hass.states.get(entity_id)
+            members = self._state_attributes(state).get("entity_id") if state else None
+            if isinstance(members, str):
+                pending.append(members)
+            elif isinstance(members, (list, tuple, set)):
+                pending.extend(member for member in members if isinstance(member, str))
+
+        return entity_ids
+
+    @staticmethod
+    def _clamp_color_temperature(state, kelvin: int) -> int:
+        """Clamp color temperature to a light's advertised physical range."""
+        attrs = AdaptiveController._state_attributes(state)
+        value = kelvin
+        try:
+            if attrs.get("min_color_temp_kelvin") is not None:
+                value = max(value, int(attrs["min_color_temp_kelvin"]))
+            if attrs.get("max_color_temp_kelvin") is not None:
+                value = min(value, int(attrs["max_color_temp_kelvin"]))
+        except (TypeError, ValueError, OverflowError):
+            return kelvin
+        return value
+
     async def _safe_turn_on(self, ent_id: str, service_data: dict) -> bool:
         """Call light.turn_on safely and report failures without breaking loop."""
         if getattr(self.hass, "is_stopping", False):
             _LOGGER.debug("Skipping light.turn_on for %s while Home Assistant is stopping", ent_id)
             return False
 
+        generated_context = Context()
+        context = Context(
+            id=f"{AUTOMATION_CONTEXT_PREFIX}{generated_context.id[len(AUTOMATION_CONTEXT_PREFIX):]}"
+        )
         try:
             await asyncio.wait_for(
                 self.hass.services.async_call(
@@ -497,6 +841,7 @@ class AdaptiveController:
                         **service_data,
                     },
                     blocking=True,
+                    context=context,
                 ),
                 timeout=SERVICE_CALL_TIMEOUT_SECONDS,
             )
@@ -526,6 +871,67 @@ class AdaptiveController:
                     err,
                 )
             _LOGGER.debug("Service call failed for %s with payload %s", ent_id, service_data, exc_info=True)
+            return False
+
+    async def _safe_native_command(
+        self,
+        ent_id: str,
+        integration: str,
+        action: str,
+        operation: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """Run one protocol command safely without falling back after dispatch."""
+        if getattr(self.hass, "is_stopping", False):
+            _LOGGER.debug(
+                "Skipping native %s %s command for %s while Home Assistant is stopping",
+                integration,
+                action,
+                ent_id,
+            )
+            return False
+
+        try:
+            await asyncio.wait_for(
+                operation(),
+                timeout=SERVICE_CALL_TIMEOUT_SECONDS,
+            )
+            self._last_service_error_log_at.pop(ent_id, None)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            now = time.time()
+            last_logged = self._last_service_error_log_at.get(ent_id, 0.0)
+            if now - last_logged >= SERVICE_ERROR_LOG_INTERVAL_SECONDS:
+                self._last_service_error_log_at[ent_id] = now
+                _LOGGER.warning(
+                    "Adaptive Lighting timed out sending native %s %s to %s "
+                    "(throttled log, retrying automatically)",
+                    integration,
+                    action,
+                    ent_id,
+                )
+            return False
+        except Exception as err:
+            now = time.time()
+            last_logged = self._last_service_error_log_at.get(ent_id, 0.0)
+            if now - last_logged >= SERVICE_ERROR_LOG_INTERVAL_SECONDS:
+                self._last_service_error_log_at[ent_id] = now
+                _LOGGER.warning(
+                    "Adaptive Lighting failed sending native %s %s to %s "
+                    "(throttled log, retrying automatically): %s",
+                    integration,
+                    action,
+                    ent_id,
+                    err,
+                )
+            _LOGGER.debug(
+                "Native %s %s command failed for %s",
+                integration,
+                action,
+                ent_id,
+                exc_info=True,
+            )
             return False
 
     @staticmethod

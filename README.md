@@ -12,7 +12,9 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 ### 🌅 **Automatic Sun-Based Adjustments**
 - **Brightness**: Automatically adjusts from 1% to 100% based on sun elevation
 - **Color Temperature**: Transitions from warm 2200K to cool 6500K throughout the day
-- **Smooth Transitions**: Gradual changes every 2 minutes with smooth 2-second transitions
+- **Smooth Transitions**: Gradual changes every 2 minutes with smooth 1-second transitions
+- **Power-Safe Updates**: Brightness and color are sent sequentially for broad bulb compatibility, while a turn-off request immediately cancels the pending sequence
+- **Native Matter and ZHA Control**: Uses power-neutral protocol commands when possible, with the normal Home Assistant light service retained as a fallback
 
 ### 🌙 **Smart Night Mode**
 - **Configurable Sleep Window**: Set your preferred bedtime and wake-up time
@@ -42,7 +44,9 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 
 ### Smart Behavior
 - **Turn-On Events**: When you turn on a light, it immediately applies the current adaptive settings
+- **Power Intent Protection**: A recent turn-off takes precedence over delayed or bouncing `on` state reports
 - **Manual Adjustments**: If you manually change brightness or color, the system temporarily stops controlling that light
+- **Reliable Native Feedback**: Delayed Matter/ZHA state reports are matched to the command that caused them instead of triggering a false manual hold
 - **Automatic Reset**: Manual override is cleared when the light is turned off and on again
 
 ## Installation
@@ -93,9 +97,11 @@ Adaptive Lighting works with any Home Assistant light entity that supports:
 - **Color temperature** (preferred) OR **RGB color** (fallback)
 
 ### Supported Light Types
+- Matter lights (native power-neutral commands)
+- Zigbee lights connected through ZHA (native power-neutral commands)
+- Zigbee2MQTT lights (Home Assistant service fallback)
 - Philips Hue
 - LIFX
-- Zigbee lights (via ZHA/Zigbee2MQTT)
 - Z-Wave lights
 - WiFi smart bulbs (Tuya, TP-Link Kasa, etc.)
 - Any other lights with brightness and color support
@@ -136,8 +142,30 @@ Adaptive Lighting works alongside your existing automations:
 
 ### Update Frequency
 - **Periodic Updates**: Every 2 minutes
-- **Transition Duration**: 2 seconds per change
+- **Transition Duration**: 1 second per change
+- **Command Ordering**: Brightness completes before color temperature is sent
 - **Turn-On Response**: Immediate
+
+### Apple Home comparison
+Apple HomeKit Adaptive Lighting can install a multi-point color-temperature curve on
+compatible accessories. Standard Matter and Zigbee light clusters do not expose an
+equivalent generic 24-hour curve upload. This integration therefore uses short native
+updates rather than persistent device-side transitions.
+
+Matter lights receive `MoveToLevel` and `MoveToColorTemperature` commands, and ZHA
+lights receive the equivalent Zigbee ZCL commands. These commands explicitly set
+`ExecuteIfOff` to false, so they cannot turn an off light on. Brightness and color
+temperature remain separate sequential commands for bulbs which discard one attribute
+when both arrive together. Avoiding overlapping long transitions also works around
+bulb firmware which can otherwise become unresponsive until power-cycled.
+
+For RGB-only lights, Zigbee2MQTT, Philips Hue, Z-Wave, Wi-Fi, and any native target
+which cannot be resolved, the integration retains the generic `light.turn_on` path.
+That fallback cancels adaptation as soon as `light.turn_off` is requested, checks the
+power state between commands, and ignores transient `on` reports while the turn-off is
+settling. If a native command has already been attempted and reports an error, the
+integration does not switch to the generic fallback during that update cycle because
+the command may still have reached the light.
 
 ### Color Calculations
 - **Sun Elevation**: Uses Home Assistant's sun integration
@@ -162,6 +190,16 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Manual override detection
 - Smart turn-on control
 - User-friendly configuration interface
+
+### Version 1.3.1
+- Removed experimental long device-side transitions because some bulbs became unresponsive
+- Retained short, power-neutral Matter and ZHA commands every 2 minutes
+- Retained sequential brightness and color-temperature delivery
+
+### Version 1.3.2
+- Prevented delayed Matter/ZHA feedback from starting a false two-hour manual hold
+- Detects explicit manual brightness/color service calls immediately
+- Continues two-minute native updates without accumulated jumps
 
 ---
 
