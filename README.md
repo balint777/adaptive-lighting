@@ -46,7 +46,6 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 - **Turn-On Events**: When you turn on a light, it immediately applies the current adaptive settings
 - **Power Intent Protection**: A recent turn-off takes precedence over delayed or bouncing `on` state reports
 - **Manual Adjustments**: If you manually change brightness or color, the system temporarily stops controlling that light
-- **Reliable Native Feedback**: Delayed Matter/ZHA state reports are matched to the command that caused them instead of triggering a false manual hold
 - **Automatic Reset**: Manual override is cleared when the light is turned off and on again
 
 ## Installation
@@ -159,6 +158,13 @@ temperature remain separate sequential commands for bulbs which discard one attr
 when both arrive together. Avoiding overlapping long transitions also works around
 bulb firmware which can otherwise become unresponsive until power-cycled.
 
+Turn-on commands issued by another Matter fabric are visible to Home Assistant only
+through the resulting state reports. If such a report arrives during the short
+turn-off race guard, the integration waits for the guard to expire and then adapts the
+light if it is still on. Attribute reports during that confirmation window are ignored
+for manual-hold detection, so a quick cross-fabric off/on cycle reliably releases the
+hold without reintroducing the turn-off race.
+
 For RGB-only lights, Zigbee2MQTT, Philips Hue, Z-Wave, Wi-Fi, and any native target
 which cannot be resolved, the integration retains the generic `light.turn_on` path.
 That fallback cancels adaptation as soon as `light.turn_off` is requested, checks the
@@ -195,11 +201,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Removed experimental long device-side transitions because some bulbs became unresponsive
 - Retained short, power-neutral Matter and ZHA commands every 2 minutes
 - Retained sequential brightness and color-temperature delivery
-
-### Version 1.3.2
-- Prevented delayed Matter/ZHA feedback from starting a false two-hour manual hold
-- Detects explicit manual brightness/color service calls immediately
-- Continues two-minute native updates without accumulated jumps
 
 ---
 
