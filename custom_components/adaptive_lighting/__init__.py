@@ -33,15 +33,29 @@ def _settings_from_entry(entry: ConfigEntry) -> Settings:
     )
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    controller = AdaptiveController(hass, _settings_from_entry(entry))
-    controller.start()
     domain_data = hass.data.setdefault(DOMAIN, {})
+    if domain_data:
+        _LOGGER.error(
+            "Ignoring duplicate Adaptive Lighting config entry %s; remove the "
+            "extra entry because only one global controller is supported",
+            entry.entry_id,
+        )
+        return True
+
+    controller = AdaptiveController(
+        hass,
+        _settings_from_entry(entry),
+        entry.entry_id,
+    )
+    # Reserve the singleton slot before the first await so concurrently restored
+    # duplicate entries cannot both start global controllers.
     domain_data[entry.entry_id] = controller
 
     try:
+        await controller.async_start()
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:
-        _LOGGER.exception("Failed to set up Adaptive Lighting platforms")
+        _LOGGER.exception("Failed to set up Adaptive Lighting")
         controller.stop()
         domain_data.pop(entry.entry_id, None)
         raise

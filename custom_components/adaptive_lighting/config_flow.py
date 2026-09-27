@@ -23,6 +23,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler(config_entry)
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
+        if self._async_current_entries():
+            return self.async_abort(reason="single_instance_allowed")
         if user_input is not None:
             return self.async_create_entry(title="Adaptive Lighting", data=user_input)
         return self.async_show_form(step_id="user", data_schema=self._schema())
