@@ -347,8 +347,33 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             2200,
             1,
             target,
+            allow_during_turn_off_guard=True,
         )
         self.assertNotIn("light.bulb", controller._cancelled_entities)
+
+    async def test_guarded_native_sequence_finishes_color_temperature(self):
+        light = self._light(brightness=255, kelvin=6500)
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        controller._last_turn_off_request["light.bulb"] = time.monotonic()
+        target = types.SimpleNamespace(
+            integration="matter",
+            async_set_brightness=AsyncMock(),
+            async_set_color_temperature=AsyncMock(),
+        )
+
+        with patch.object(coordinator.asyncio, "sleep", new=AsyncMock()):
+            await controller._apply_native_light_settings(
+                "light.bulb",
+                "ct",
+                1,
+                2200,
+                1,
+                target,
+                allow_during_turn_off_guard=True,
+            )
+
+        target.async_set_brightness.assert_awaited_once_with(1, 1)
+        target.async_set_color_temperature.assert_awaited_once_with(2200, 1)
 
     async def test_guarded_generic_turn_on_keeps_confirmation_delay(self):
         light = self._light()

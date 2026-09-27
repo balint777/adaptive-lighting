@@ -387,6 +387,8 @@ class AdaptiveController:
         kelvin: int,
         transition_seconds: int,
         target: NativeLightTarget,
+        *,
+        allow_during_turn_off_guard: bool = False,
     ) -> None:
         """Apply sequential, power-neutral Matter/Zigbee commands."""
         self._begin_native_expectation(
@@ -413,7 +415,10 @@ class AdaptiveController:
 
         await asyncio.sleep(max(transition_seconds, MIN_SPLIT_COMMAND_DELAY_SECONDS))
 
-        if not self._can_continue_light_update(ent_id):
+        if not self._can_continue_light_update(
+            ent_id,
+            allow_during_turn_off_guard=allow_during_turn_off_guard,
+        ):
             return
 
         self._last_automation_change[ent_id] = time.time()
@@ -695,6 +700,7 @@ class AdaptiveController:
                         self._clamp_color_temperature(state, kelvin),
                         self._safe_transition_seconds(),
                         native_target,
+                        allow_during_turn_off_guard=True,
                     ),
                 )
                 return
@@ -1069,11 +1075,19 @@ class AdaptiveController:
             return False
         return time.monotonic() - turned_off_at < TURN_OFF_GUARD_SECONDS
 
-    def _can_continue_light_update(self, entity_id: str) -> bool:
+    def _can_continue_light_update(
+        self,
+        entity_id: str,
+        *,
+        allow_during_turn_off_guard: bool = False,
+    ) -> bool:
         """Return whether a split light update may send its next command."""
         if not self._enabled or entity_id in self._cancelled_entities:
             return False
-        if self._is_guarded_after_turn_off(entity_id):
+        if (
+            not allow_during_turn_off_guard
+            and self._is_guarded_after_turn_off(entity_id)
+        ):
             return False
         state = self.hass.states.get(entity_id)
         return state is not None and self._is_state_on(state)

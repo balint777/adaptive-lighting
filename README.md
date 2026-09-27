@@ -221,6 +221,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Apply native Matter/ZHA settings immediately after a cross-fabric off/on cycle
 - Retain the five-second safety confirmation for generic service fallbacks
 
+### Version 1.3.5
+- Allow the color-temperature phase of a native fast turn-on to finish through the guard
+
 ---
 
 **Enjoy better lighting that adapts to your natural rhythm! 🌞🌙**
