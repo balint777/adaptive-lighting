@@ -11,11 +11,17 @@ from typing import Awaitable, Callable, Dict, List, Set
 
 from homeassistant.core import Context, HomeAssistant, Event, callback
 from homeassistant.const import EVENT_CALL_SERVICE, EVENT_STATE_CHANGED
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .const import DEFAULT_NIGHT_START, DEFAULT_NIGHT_END
-from .native import NativeLightController, NativeLightTarget
+from .const import DEFAULT_NIGHT_START, DEFAULT_NIGHT_END, DOMAIN
+from .native import (
+    NativeLightController,
+    NativeLightTarget,
+    NativeResolutionStatus,
+)
 from .util import clamp, lerp, parse_time_str, in_window, cct_to_rgb, is_in_transition_period
 
 SUPPORTED_COLOR_KEYS = {"supported_color_modes", "color_mode", "color_modes"}
@@ -32,6 +38,25 @@ TRACKING_STALE_SECONDS = 24 * 60 * 60
 SERVICE_ERROR_LOG_INTERVAL_SECONDS = 5 * 60
 CONFIG_WARNING_LOG_INTERVAL_SECONDS = 5 * 60
 SERVICE_CALL_TIMEOUT_SECONDS = 15
+TURN_ON_INTENT_SECONDS = 30
+NATIVE_RECONCILE_SECONDS = 5
+NATIVE_BRIGHTNESS_TOLERANCE_PCT = 6.0
+NATIVE_COLOR_TOLERANCE_KELVIN = 200
+HOLD_STORAGE_VERSION = 1
+HOLD_SAVE_DELAY_SECONDS = 5
+GROUP_MEMBER_KEYS = {"entity_id", "group_entities"}
+LIGHT_ADJUSTMENT_KEYS = {
+    "brightness",
+    "brightness_pct",
+    "color_temp",
+    "color_temp_kelvin",
+    "hs_color",
+    "rgb_color",
+    "rgbw_color",
+    "rgbww_color",
+    "xy_color",
+    "white",
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,15 +97,37 @@ class Settings:
         return 2200 # warm color temperature during sleep
 
 
+@dataclass
+class NativeExpectedState:
+    """Native command result used to distinguish feedback from manual writes."""
+
+    generation: int
+    mode: str
+    brightness: int
+    kelvin: int | None
+    settle_after: float
+    confirmed: bool = False
+    report_seen: bool = False
+    divergence_seen: bool = False
+    last_report_at: float = 0.0
+
+
 
 class AdaptiveController:
-    def __init__(self, hass: HomeAssistant, settings: Settings):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        settings: Settings,
+        entry_id: str = "default",
+    ):
         self.hass = hass
         self.settings = settings
         self._unsub = None
         self._event_unsub = None  # For event tracking
         self._service_event_unsub = None  # For observing power commands before state updates
-        self._manual_hold_entities: Dict[str, float] = {}  # Entities with manual adjustments (entity_id -> timestamp)
+        # Manual holds are stored as UTC Unix expiry timestamps so they can be
+        # restored safely after a Home Assistant restart.
+        self._manual_hold_entities: Dict[str, float] = {}
         self._last_automation_change: Dict[str, float] = {}  # Track our own changes
         self._last_turn_off_request: Dict[str, float] = {}
         self._last_turn_on_request: Dict[str, float] = {}
@@ -94,6 +141,19 @@ class AdaptiveController:
         self._last_service_error_log_at: Dict[str, float] = {}
         self._last_config_warning_log_at = 0.0
         self._native_lights = NativeLightController(hass)
+        self._native_expected_states: Dict[str, NativeExpectedState] = {}
+        self._native_reconcile_tasks: Dict[str, asyncio.Task] = {}
+        self._native_generation = 0
+        self._hold_store: Store[dict] = Store(
+            hass,
+            HOLD_STORAGE_VERSION,
+            f"{DOMAIN}.{entry_id}.state",
+        )
+
+    async def async_start(self) -> None:
+        """Restore durable control state and start listeners."""
+        await self._async_restore_manual_holds()
+        self.start()
 
     def set_enabled(self, enabled: bool) -> None:
         if self._enabled == enabled:
@@ -103,7 +163,10 @@ class AdaptiveController:
         if not enabled:
             for entity_id in tuple(self._pending_tasks):
                 self._cancel_pending_task(entity_id)
+            for entity_id in tuple(self._native_reconcile_tasks):
+                self._cancel_native_reconciliation(entity_id)
             self._cancelled_entities.clear()
+            self._native_expected_states.clear()
         else:
             self._invalidate_targets_cache()
 
@@ -154,9 +217,13 @@ class AdaptiveController:
         for task in self._pending_tasks.values():
             task.cancel()
         self._pending_tasks.clear()
+        for task in self._native_reconcile_tasks.values():
+            task.cancel()
+        self._native_reconcile_tasks.clear()
         self._cancelled_entities.clear()
         self._last_turn_off_request.clear()
         self._last_turn_on_request.clear()
+        self._native_expected_states.clear()
         self._invalidate_targets_cache()
 
     async def _apply_all(self, _now=None):
@@ -241,16 +308,14 @@ class AdaptiveController:
         if not state or not self._is_state_on(state):
             return
 
-        # Matter and ZHA expose protocol commands which change level/color but
-        # not the On/Off state. Prefer those for CT and brightness-only lights.
-        # RGB conversion remains on the generic Home Assistant path.
-        native_target = None
-        if mode in {"ct", "brightness"}:
-            native_target = self._native_lights.resolve(
-                ent_id,
-                require_color_temperature=mode == "ct",
-            )
-        if native_target is not None:
+        # Matter and ZHA must never fall through to light.turn_on merely because
+        # their native client/endpoint is temporarily unavailable. The generic
+        # service is reserved for genuinely non-native integrations.
+        native_resolution = self._native_lights.resolve(ent_id, mode=mode)
+        if native_resolution.status is NativeResolutionStatus.TARGET:
+            native_target = native_resolution.target
+            if native_target is None:
+                return
             await self._apply_native_light_settings(
                 ent_id,
                 mode,
@@ -260,6 +325,13 @@ class AdaptiveController:
                 native_target,
             )
             return
+        if native_resolution.is_native:
+            return
+
+        # Do not compare generic service feedback with an earlier native
+        # expectation if the entity's integration or capabilities changed.
+        self._native_expected_states.pop(ent_id, None)
+        self._cancel_native_reconciliation(ent_id)
 
         # Some bulbs discard either brightness or color when both are sent in
         # one command. Send brightness first, then color after the brightness
@@ -317,6 +389,13 @@ class AdaptiveController:
         target: NativeLightTarget,
     ) -> None:
         """Apply sequential, power-neutral Matter/Zigbee commands."""
+        self._begin_native_expectation(
+            ent_id,
+            mode,
+            brightness,
+            kelvin,
+            transition_seconds,
+        )
         self._last_automation_change[ent_id] = time.time()
         if not await self._safe_native_command(
             ent_id,
@@ -376,15 +455,26 @@ class AdaptiveController:
                 if entity_id not in targets:
                     continue
 
+                state = self.hass.states.get(entity_id)
+                if (
+                    service == "turn_on"
+                    and state is not None
+                    and self._is_state_on(state)
+                    and any(key in service_data for key in LIGHT_ADJUSTMENT_KEYS)
+                ):
+                    # Service data expresses manual brightness/color intent
+                    # directly, so do not wait for an ambiguous state report.
+                    self._set_manual_hold(entity_id)
+                    continue
+
                 is_turning_off = service == "turn_off"
                 if service == "toggle":
-                    state = self.hass.states.get(entity_id)
                     is_turning_off = state is not None and self._is_state_on(state)
 
                 if is_turning_off:
                     self._last_turn_off_request[entity_id] = now
                     self._cancel_entity_processing(entity_id)
-                    self._manual_hold_entities.pop(entity_id, None)
+                    self._clear_manual_hold(entity_id)
                 else:
                     self._last_turn_on_request[entity_id] = now
                     self._cancelled_entities.discard(entity_id)
@@ -428,7 +518,14 @@ class AdaptiveController:
 
             # Handle turn-on events
             if new_state_value == "on" and old_state_value != "on":
-                self._handle_turn_on(entity_id, targets[entity_id])
+                if (
+                    old_state_value == "off"
+                    or self._has_recent_turn_on_request(entity_id)
+                ):
+                    self._handle_turn_on(entity_id, targets[entity_id])
+                # unavailable/unknown/startup -> on is availability recovery,
+                # not proof of a power cycle. Preserve any manual hold and let
+                # the normal periodic pass reconcile an unheld light.
                 return
 
             # Handle manual adjustments (only for lights that are on)
@@ -440,24 +537,33 @@ class AdaptiveController:
     # --------------------------- helpers ----------------------------------
     def _clear_expired_holds(self) -> None:
         """Remove stale manual holds to avoid permanent lockout."""
-        current_time = time.monotonic()
+        current_time = time.time()
         expired = [
-            ent_id
-            for ent_id, ts in self._manual_hold_entities.items()
-            if current_time - ts > MANUAL_HOLD_SECONDS
+            ent_id for ent_id, expires_at in self._manual_hold_entities.items()
+            if current_time >= expires_at
         ]
         for ent_id in expired:
             self._manual_hold_entities.pop(ent_id, None)
+        if expired:
+            self._schedule_holds_save()
 
     def _clear_stale_tracking(self) -> None:
         """Prune stale automation timestamps for entities not updated recently."""
         now = time.time()
         monotonic_now = time.monotonic()
         existing_lights = {state.entity_id for state in self.hass.states.async_all("light")}
+        entity_registry = er.async_get(self.hass)
 
+        removed_hold = False
         for ent_id in tuple(self._manual_hold_entities):
-            if ent_id not in existing_lights:
+            if (
+                ent_id not in existing_lights
+                and entity_registry.async_get(ent_id) is None
+            ):
                 self._manual_hold_entities.pop(ent_id, None)
+                removed_hold = True
+        if removed_hold:
+            self._schedule_holds_save()
 
         stale = [
             ent_id
@@ -474,6 +580,11 @@ class AdaptiveController:
         ]
         for ent_id in stale_service_logs:
             self._last_service_error_log_at.pop(ent_id, None)
+
+        for ent_id in tuple(self._native_expected_states):
+            if ent_id not in existing_lights:
+                self._native_expected_states.pop(ent_id, None)
+                self._cancel_native_reconciliation(ent_id)
 
         for tracking in (self._last_turn_off_request, self._last_turn_on_request):
             stale_requests = [
@@ -504,6 +615,12 @@ class AdaptiveController:
         if task is not None:
             task.cancel()
 
+    def _cancel_native_reconciliation(self, entity_id: str) -> None:
+        """Cancel a delayed native-feedback reconciliation task."""
+        task = self._native_reconcile_tasks.pop(entity_id, None)
+        if task is not None:
+            task.cancel()
+
     def _track_entity_task(self, entity_id: str, coro) -> asyncio.Task:
         """Create and track an entity task with uniform cleanup/exception handling."""
         existing = self._pending_tasks.get(entity_id)
@@ -530,6 +647,8 @@ class AdaptiveController:
         """Cancel all pending processing for the entity."""
         self._cancelled_entities.add(entity_id)
         self._cancel_pending_task(entity_id)
+        self._cancel_native_reconciliation(entity_id)
+        self._native_expected_states.pop(entity_id, None)
 
     def _handle_turn_off(self, entity_id: str) -> None:
         """Handle entity turn-off transitions."""
@@ -542,7 +661,7 @@ class AdaptiveController:
         if last_turn_on <= last_turn_off or now - last_turn_on >= TURN_OFF_GUARD_SECONDS:
             self._last_turn_off_request[entity_id] = now
         self._cancel_entity_processing(entity_id)
-        self._manual_hold_entities.pop(entity_id, None)
+        self._clear_manual_hold(entity_id)
 
     def _handle_turn_on(self, entity_id: str, mode: str) -> None:
         """Handle entity turn-on transitions."""
@@ -553,7 +672,9 @@ class AdaptiveController:
         # as a pending task also prevents startup attribute reports from being
         # mistaken for a new manual adjustment. An explicit later turn_on
         # request bypasses this guard immediately.
-        self._manual_hold_entities.pop(entity_id, None)
+        self._clear_manual_hold(entity_id)
+        self._native_expected_states.pop(entity_id, None)
+        self._cancel_native_reconciliation(entity_id)
         if self._is_guarded_after_turn_off(entity_id):
             self._track_entity_task(
                 entity_id,
@@ -585,7 +706,7 @@ class AdaptiveController:
             return
 
         self._cancelled_entities.discard(entity_id)
-        self._manual_hold_entities.pop(entity_id, None)
+        self._clear_manual_hold(entity_id)
         brightness, kelvin = self._compute_targets()
         await self._apply_light_settings(
             entity_id,
@@ -596,7 +717,38 @@ class AdaptiveController:
 
     def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:
         """Track manual user adjustments and hold adaptive updates temporarily."""
-        # Ignore updates while we still have an in-flight automation task for this entity.
+        old_attrs = self._state_attributes(old_state)
+        new_attrs = self._state_attributes(new_state)
+        if not self._adaptive_attributes_changed(old_attrs, new_attrs):
+            return
+
+        expected = self._native_expected_states.get(entity_id)
+        if expected is not None:
+            # Native protocol writes have no HA service context. Record every
+            # report, including reports produced by another Matter fabric, and
+            # decide only after the transition/reporting stream has settled.
+            expected.report_seen = True
+            expected.last_report_at = time.monotonic()
+            matches = self._native_state_matches_expectation(
+                new_attrs,
+                expected,
+            )
+            if matches:
+                expected.confirmed = True
+                expected.divergence_seen = False
+                self._cancel_native_reconciliation(entity_id)
+            elif expected.confirmed:
+                expected.divergence_seen = True
+                self._schedule_native_reconciliation(entity_id, expected)
+            else:
+                # Until this generation has matched once, divergent reports may
+                # simply be an old value or an intermediate transition report.
+                # Keep retrying adaptation instead of creating a false hold.
+                expected.divergence_seen = False
+            return
+
+        # Generic light service feedback still has no dependable context on all
+        # integrations, so keep the existing in-flight/grace suppression there.
         if entity_id in self._pending_tasks:
             return
 
@@ -616,15 +768,232 @@ class AdaptiveController:
         if state_updated <= last_automation + grace:
             return
 
-        old_attrs = self._state_attributes(old_state)
-        new_attrs = self._state_attributes(new_state)
+        self._set_manual_hold(entity_id)
+
+    def _begin_native_expectation(
+        self,
+        entity_id: str,
+        mode: str,
+        brightness: int,
+        kelvin: int,
+        transition_seconds: int,
+    ) -> None:
+        """Record a new native command generation before it is dispatched."""
+        self._native_generation += 1
+        self._cancel_native_reconciliation(entity_id)
+        transition_count = 2 if mode == "ct" else 1
+        transition_window = max(
+            transition_seconds,
+            MIN_SPLIT_COMMAND_DELAY_SECONDS,
+        ) * transition_count
+        expected = NativeExpectedState(
+            generation=self._native_generation,
+            mode=mode,
+            brightness=brightness,
+            kelvin=kelvin if mode == "ct" else None,
+            settle_after=(
+                time.monotonic()
+                + transition_window
+                + NATIVE_RECONCILE_SECONDS
+            ),
+        )
+        state = self.hass.states.get(entity_id)
+        if state is not None and self._is_state_on(state):
+            expected.confirmed = self._native_state_matches_expectation(
+                self._state_attributes(state),
+                expected,
+            )
+        self._native_expected_states[entity_id] = expected
+
+    def _schedule_native_reconciliation(
+        self,
+        entity_id: str,
+        expected: NativeExpectedState,
+    ) -> None:
+        """Recheck divergent native feedback after it has remained stable."""
+        self._cancel_native_reconciliation(entity_id)
+        task = self.hass.async_create_task(
+            self._reconcile_native_feedback(entity_id, expected.generation)
+        )
+        self._native_reconcile_tasks[entity_id] = task
+
+        def cleanup(done_task: asyncio.Task) -> None:
+            if self._native_reconcile_tasks.get(entity_id) is done_task:
+                self._native_reconcile_tasks.pop(entity_id, None)
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = done_task.exception()
+                if exc is not None:
+                    _LOGGER.debug(
+                        "Native feedback reconciliation failed for %s: %s",
+                        entity_id,
+                        exc,
+                    )
+
+        task.add_done_callback(cleanup)
+
+    async def _reconcile_native_feedback(
+        self,
+        entity_id: str,
+        generation: int,
+    ) -> None:
+        """Create a hold only when foreign feedback remains divergent."""
+        expected = self._native_expected_states.get(entity_id)
+        if expected is None or expected.generation != generation:
+            return
+
+        reconcile_at = max(
+            expected.settle_after,
+            expected.last_report_at + NATIVE_RECONCILE_SECONDS,
+        )
+        delay = reconcile_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        expected = self._native_expected_states.get(entity_id)
         if (
+            expected is None
+            or expected.generation != generation
+            or not expected.confirmed
+            or not expected.report_seen
+            or not expected.divergence_seen
+        ):
+            return
+
+        state = self.hass.states.get(entity_id)
+        if state is None or not self._is_state_on(state):
+            return
+        if self._native_state_matches_expectation(
+            self._state_attributes(state),
+            expected,
+        ):
+            expected.divergence_seen = False
+            return
+
+        # Remove this task first so _set_manual_hold does not cancel itself.
+        self._native_reconcile_tasks.pop(entity_id, None)
+        self._set_manual_hold(entity_id)
+
+    @staticmethod
+    def _adaptive_attributes_changed(old_attrs: dict, new_attrs: dict) -> bool:
+        """Return whether brightness or a controlled color attribute changed."""
+        return (
             old_attrs.get("brightness") != new_attrs.get("brightness")
             or old_attrs.get("color_temp") != new_attrs.get("color_temp")
-            or old_attrs.get("color_temp_kelvin") != new_attrs.get("color_temp_kelvin")
+            or old_attrs.get("color_temp_kelvin")
+            != new_attrs.get("color_temp_kelvin")
             or old_attrs.get("rgb_color") != new_attrs.get("rgb_color")
+        )
+
+    @staticmethod
+    def _native_state_matches_expectation(
+        attrs: dict,
+        expected: NativeExpectedState,
+    ) -> bool:
+        """Return whether reported attributes agree with a native generation."""
+        brightness = attrs.get("brightness")
+        if brightness is None:
+            return False
+        try:
+            brightness_pct = float(brightness) * 100 / 255
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            abs(brightness_pct - expected.brightness)
+            > NATIVE_BRIGHTNESS_TOLERANCE_PCT
         ):
-            self._manual_hold_entities[entity_id] = time.monotonic()
+            return False
+
+        if expected.mode == "ct" and expected.kelvin is not None:
+            reported_kelvin = AdaptiveController._reported_color_temperature_kelvin(
+                attrs
+            )
+            if reported_kelvin is None:
+                return False
+            if abs(reported_kelvin - expected.kelvin) > NATIVE_COLOR_TOLERANCE_KELVIN:
+                return False
+
+        return True
+
+    @staticmethod
+    def _reported_color_temperature_kelvin(attrs: dict) -> float | None:
+        """Read a reported color temperature in Kelvin from HA attributes."""
+        kelvin = attrs.get("color_temp_kelvin")
+        if kelvin is not None:
+            try:
+                return float(kelvin)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        mireds = attrs.get("color_temp")
+        if mireds is None:
+            return None
+        try:
+            return 1_000_000 / float(mireds)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return None
+
+    def _set_manual_hold(self, entity_id: str) -> None:
+        """Suspend adaptation after confirmed manual brightness/color intent."""
+        self._manual_hold_entities[entity_id] = time.time() + MANUAL_HOLD_SECONDS
+        self._native_expected_states.pop(entity_id, None)
+        self._cancel_native_reconciliation(entity_id)
+        self._cancel_pending_task(entity_id)
+        self._schedule_holds_save()
+
+    def _clear_manual_hold(self, entity_id: str) -> None:
+        """Release and persist a manual hold if one exists."""
+        if self._manual_hold_entities.pop(entity_id, None) is not None:
+            self._schedule_holds_save()
+
+    async def _async_restore_manual_holds(self) -> None:
+        """Restore unexpired holds for lights still known to Home Assistant."""
+        try:
+            stored = await self._hold_store.async_load()
+        except Exception:
+            _LOGGER.exception("Could not restore Adaptive Lighting manual holds")
+            return
+        if not isinstance(stored, Mapping):
+            return
+
+        raw_holds = stored.get("manual_holds")
+        if not isinstance(raw_holds, Mapping):
+            return
+
+        now = time.time()
+        registry = er.async_get(self.hass)
+        for entity_id, raw_expiry in raw_holds.items():
+            if not isinstance(entity_id, str) or not entity_id.startswith("light."):
+                continue
+            try:
+                expires_at = float(raw_expiry)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if expires_at <= now:
+                continue
+            if (
+                self.hass.states.get(entity_id) is None
+                and registry.async_get(entity_id) is None
+            ):
+                continue
+            self._manual_hold_entities[entity_id] = expires_at
+
+    def _manual_holds_to_store(self) -> dict:
+        """Return a serialization-safe snapshot for Store."""
+        now = time.time()
+        return {
+            "manual_holds": {
+                entity_id: expires_at
+                for entity_id, expires_at in self._manual_hold_entities.items()
+                if expires_at > now
+            }
+        }
+
+    def _schedule_holds_save(self) -> None:
+        """Debounce persistence of manual-hold changes."""
+        self._hold_store.async_delay_save(
+            self._manual_holds_to_store,
+            HOLD_SAVE_DELAY_SECONDS,
+        )
 
     @staticmethod
     def _is_state_on(state) -> bool:
@@ -659,6 +1028,14 @@ class AdaptiveController:
                     fallback,
                 )
             return parse_time_str(fallback)
+
+    def _has_recent_turn_on_request(self, entity_id: str) -> bool:
+        """Return whether HA recently observed explicit turn-on intent."""
+        requested_at = self._last_turn_on_request.get(entity_id)
+        return (
+            requested_at is not None
+            and time.monotonic() - requested_at < TURN_ON_INTENT_SECONDS
+        )
 
     def _is_guarded_after_turn_off(self, entity_id: str) -> bool:
         """Return whether a recent off request still owns the power intent."""
@@ -874,6 +1251,7 @@ class AdaptiveController:
     def _discover_targets(self) -> Dict[str, str]:
         # Return mapping entity_id -> mode ("ct" or "rgb")
         out: Dict[str, str] = {}
+        entity_registry = er.async_get(self.hass)
         excluded = {
             ent_id for ent_id in self.settings.exclude_entities if isinstance(ent_id, str)
         }
@@ -887,7 +1265,19 @@ class AdaptiveController:
             ent_id = state.entity_id
             if not allowed(ent_id):
                 continue
-            attrs = state.attributes or {}
+            attrs = self._state_attributes(state)
+            registry_entry = entity_registry.async_get(ent_id)
+            if (
+                any(key in attrs for key in GROUP_MEMBER_KEYS)
+                or (
+                    registry_entry is not None
+                    and getattr(registry_entry, "platform", None) == "group"
+                )
+            ):
+                # Applying brightness through a group can power on members that
+                # are intentionally off. Members are discovered individually;
+                # groups remain expanded only in the service-intent listener.
+                continue
             color_modes = None
             for key in SUPPORTED_COLOR_KEYS:
                 if key in attrs:

@@ -14,7 +14,7 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 - **Color Temperature**: Transitions from warm 2200K to cool 6500K throughout the day
 - **Smooth Transitions**: Gradual changes every 2 minutes with smooth 1-second transitions
 - **Power-Safe Updates**: Brightness and color are sent sequentially for broad bulb compatibility, while a turn-off request immediately cancels the pending sequence
-- **Native Matter and ZHA Control**: Uses power-neutral protocol commands when possible, with the normal Home Assistant light service retained as a fallback
+- **Native Matter and ZHA Control**: Uses power-neutral protocol commands and fails closed if that native path is temporarily unavailable
 
 ### 🌙 **Smart Night Mode**
 - **Configurable Sleep Window**: Set your preferred bedtime and wake-up time
@@ -47,6 +47,7 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 - **Power Intent Protection**: A recent turn-off takes precedence over delayed or bouncing `on` state reports
 - **Manual Adjustments**: If you manually change brightness or color, the system temporarily stops controlling that light
 - **Automatic Reset**: Manual override is cleared when the light is turned off and on again
+- **Restart-Safe State**: The enable switch and active manual holds survive Home Assistant restarts
 
 ## Installation
 
@@ -107,11 +108,10 @@ Adaptive Lighting works with any Home Assistant light entity that supports:
 
 ## Advanced Usage
 
-### Multiple Instances
-You can create multiple Adaptive Lighting instances for different areas:
-1. Create separate instances with different settings
-2. Use the "Exclude Entities" feature to assign lights to specific instances
-3. Perfect for having different sleep schedules in different rooms
+### Single Instance
+Adaptive Lighting uses one global controller. Home Assistant prevents adding a second
+instance so two schedules cannot send competing commands to the same bulbs. Use
+**Exclude Entities** to leave selected lights under another automation's control.
 
 ### Integration with Other Automations
 Adaptive Lighting works alongside your existing automations:
@@ -128,8 +128,8 @@ Adaptive Lighting works alongside your existing automations:
 - Restart Home Assistant to reload the component
 
 ### Manual Changes Not Respected
-- Manual override detection has a 1-second grace period
-- Very rapid changes might not be detected as manual
+- Native Matter/ZHA feedback is allowed to settle before a manual override is confirmed
+- A stable value which differs from the requested adaptive value starts a two-hour hold
 - Turn the light off and on to reset manual override
 
 ### Configuration Not Saving
@@ -161,17 +161,21 @@ bulb firmware which can otherwise become unresponsive until power-cycled.
 Turn-on commands issued by another Matter fabric are visible to Home Assistant only
 through the resulting state reports. If such a report arrives during the short
 turn-off race guard, the integration waits for the guard to expire and then adapts the
-light if it is still on. Attribute reports during that confirmation window are ignored
-for manual-hold detection, so a quick cross-fabric off/on cycle reliably releases the
-hold without reintroducing the turn-off race.
+light if it is still on. Native brightness/color reports are matched to a command
+generation and reconciled after they settle. Intermediate transition reports do not
+start a hold, while a stable divergent Apple Home setting does. Availability recovery
+(`unavailable`/`unknown` to `on`) is not treated as a power cycle and therefore cannot
+silently release an existing hold.
 
-For RGB-only lights, Zigbee2MQTT, Philips Hue, Z-Wave, Wi-Fi, and any native target
-which cannot be resolved, the integration retains the generic `light.turn_on` path.
-That fallback cancels adaptation as soon as `light.turn_off` is requested, checks the
-power state between commands, and ignores transient `on` reports while the turn-off is
-settling. If a native command has already been attempted and reports an error, the
-integration does not switch to the generic fallback during that update cycle because
-the command may still have reached the light.
+For Zigbee2MQTT, Philips Hue, Z-Wave, Wi-Fi, and other non-native integrations, the
+integration retains the generic `light.turn_on` path. That fallback cancels adaptation
+as soon as `light.turn_off` is requested and checks the power state between commands.
+Recognized Matter/ZHA entities never fall through to this power-changing service when
+their native client, endpoint, or required cluster is unavailable; that update is
+skipped and retried later. RGB-only Matter/ZHA entities are likewise skipped until a
+power-neutral native color command is implemented. Home Assistant light groups are
+observed for user power intent but excluded as write targets, preventing an on group
+from powering up members which were intentionally off.
 
 ### Color Calculations
 - **Sun Elevation**: Uses Home Assistant's sun integration
@@ -201,6 +205,16 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Removed experimental long device-side transitions because some bulbs became unresponsive
 - Retained short, power-neutral Matter and ZHA commands every 2 minutes
 - Retained sequential brightness and color-temperature delivery
+
+### Version 1.3.2
+- Added delayed confirmation for quick cross-fabric off/on cycles
+
+### Version 1.3.3
+- Fail closed when native Matter/ZHA resolution is unavailable
+- Exclude Home Assistant light groups from adaptive writes
+- Preserve manual holds across availability recovery and Home Assistant restarts
+- Reconcile stable foreign-fabric changes against native command generations
+- Restore the integration enable switch after restart and enforce one global instance
 
 ---
 

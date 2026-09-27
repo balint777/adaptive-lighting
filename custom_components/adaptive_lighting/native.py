@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol
 
 from homeassistant.core import HomeAssistant
@@ -42,6 +43,28 @@ class NativeLightTarget(Protocol):
         self, kelvin: int, transition_seconds: float
     ) -> None:
         """Change color temperature without changing the On/Off state."""
+
+
+class NativeResolutionStatus(Enum):
+    """Outcome of resolving a light's power-neutral protocol target."""
+
+    NOT_NATIVE = "not_native"
+    TARGET = "target"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class NativeResolution:
+    """Typed native resolution result used to keep fallback behavior safe."""
+
+    status: NativeResolutionStatus
+    target: NativeLightTarget | None = None
+    integration: str | None = None
+
+    @property
+    def is_native(self) -> bool:
+        """Return whether the entity belongs to a native-capable integration."""
+        return self.status is not NativeResolutionStatus.NOT_NATIVE
 
 
 def _transition_tenths(transition_seconds: float) -> int:
@@ -183,45 +206,78 @@ class NativeLightController:
         self.hass = hass
         self._announced: set[tuple[str, str]] = set()
         self._resolution_warnings: set[tuple[str, str]] = set()
+        self._known_native_integrations: dict[str, str] = {}
 
     def resolve(
-        self, entity_id: str, *, require_color_temperature: bool
-    ) -> NativeLightTarget | None:
-        """Resolve a native target, or return None to use the HA fallback."""
+        self, entity_id: str, *, mode: str
+    ) -> NativeResolution:
+        """Resolve a target and distinguish non-native from unsafe fallback cases."""
         entry = er.async_get(self.hass).async_get(entity_id)
         if entry is None:
-            return None
+            integration = self._known_native_integrations.get(entity_id)
+            if integration is not None:
+                self._warn_unavailable(
+                    entity_id,
+                    integration,
+                    "the entity registry entry is temporarily unavailable",
+                )
+                return NativeResolution(
+                    NativeResolutionStatus.UNAVAILABLE,
+                    integration=integration,
+                )
+            return NativeResolution(NativeResolutionStatus.NOT_NATIVE)
 
         integration = getattr(entry, "platform", None)
         if integration not in {MATTER_DOMAIN, ZHA_DOMAIN}:
-            return None
+            self._known_native_integrations.pop(entity_id, None)
+            return NativeResolution(NativeResolutionStatus.NOT_NATIVE)
+        self._known_native_integrations[entity_id] = integration
+
+        # RGB-only Matter/ZHA entities cannot safely use light.turn_on as a
+        # fallback because that service may change their On/Off state. Native
+        # color commands can be added later, but until then fail closed.
+        if mode not in {"ct", "brightness"}:
+            self._warn_unavailable(
+                entity_id,
+                integration,
+                "the entity requires an unsupported native color command",
+            )
+            return NativeResolution(
+                NativeResolutionStatus.UNAVAILABLE,
+                integration=integration,
+            )
 
         try:
             if integration == MATTER_DOMAIN:
-                target = self._resolve_matter(entry, require_color_temperature)
+                target = self._resolve_matter(
+                    entry,
+                    require_color_temperature=mode == "ct",
+                )
             else:
                 target = self._resolve_zha(entry)
         except Exception as err:
-            warning_key = (entity_id, integration)
-            if warning_key not in self._resolution_warnings:
-                self._resolution_warnings.add(warning_key)
-                _LOGGER.warning(
-                    "Could not initialize native %s control for %s; using the Home "
-                    "Assistant light service fallback: %s",
-                    integration,
-                    entity_id,
-                    err,
-                )
+            self._warn_unavailable(entity_id, integration, str(err))
             _LOGGER.debug(
                 "Native %s target resolution failed for %s",
                 integration,
                 entity_id,
                 exc_info=True,
             )
-            return None
+            return NativeResolution(
+                NativeResolutionStatus.UNAVAILABLE,
+                integration=integration,
+            )
 
         if target is None:
-            return None
+            self._warn_unavailable(
+                entity_id,
+                integration,
+                "the endpoint or required cluster is not currently available",
+            )
+            return NativeResolution(
+                NativeResolutionStatus.UNAVAILABLE,
+                integration=integration,
+            )
 
         announce_key = (entity_id, integration)
         if announce_key not in self._announced:
@@ -231,7 +287,27 @@ class NativeLightController:
                 integration,
                 entity_id,
             )
-        return target
+        return NativeResolution(
+            NativeResolutionStatus.TARGET,
+            target=target,
+            integration=integration,
+        )
+
+    def _warn_unavailable(
+        self, entity_id: str, integration: str, reason: str
+    ) -> None:
+        """Log a native-resolution failure once without suggesting unsafe fallback."""
+        warning_key = (entity_id, integration)
+        if warning_key in self._resolution_warnings:
+            return
+        self._resolution_warnings.add(warning_key)
+        _LOGGER.warning(
+            "Could not initialize power-neutral native %s control for %s; "
+            "skipping adaptive updates until it becomes available: %s",
+            integration,
+            entity_id,
+            reason,
+        )
 
     def _resolve_matter(
         self, entry: Any, require_color_temperature: bool
