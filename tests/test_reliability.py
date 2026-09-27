@@ -258,6 +258,45 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         controller._safe_turn_on.assert_awaited_once()
 
+    async def test_regular_native_update_uses_ten_second_transition(self):
+        light = self._light()
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        target = types.SimpleNamespace(
+            integration="matter",
+            async_set_brightness=AsyncMock(),
+            async_set_color_temperature=AsyncMock(),
+        )
+        controller._native_lights.resolve = Mock(
+            return_value=native.NativeResolution(
+                native.NativeResolutionStatus.TARGET,
+                target=target,
+                integration="matter",
+            )
+        )
+
+        await controller._apply_light_settings(
+            "light.bulb", "brightness", 25, 2700
+        )
+
+        target.async_set_brightness.assert_awaited_once_with(25, 10)
+
+    async def test_unguarded_turn_on_uses_one_second_transition(self):
+        light = self._light()
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        controller._compute_targets = Mock(return_value=(1, 2200))
+        controller._apply_light_settings = AsyncMock()
+
+        controller._handle_turn_on("light.bulb", "ct")
+        await asyncio.sleep(0)
+
+        controller._apply_light_settings.assert_awaited_once_with(
+            "light.bulb",
+            "ct",
+            1,
+            2200,
+            transition_seconds=1,
+        )
+
     async def test_group_entities_are_not_write_targets(self):
         member = self._light("light.member")
         attribute_group = self._light(
@@ -391,6 +430,25 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         controller._confirm_guarded_turn_on.assert_awaited_once_with(
             "light.bulb", "ct"
+        )
+
+    async def test_guarded_generic_confirmation_uses_one_second_transition(self):
+        light = self._light()
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        controller._last_turn_off_request["light.bulb"] = (
+            time.monotonic() - coordinator.TURN_OFF_GUARD_SECONDS
+        )
+        controller._compute_targets = Mock(return_value=(1, 2200))
+        controller._apply_light_settings = AsyncMock()
+
+        await controller._confirm_guarded_turn_on("light.bulb", "ct")
+
+        controller._apply_light_settings.assert_awaited_once_with(
+            "light.bulb",
+            "ct",
+            1,
+            2200,
+            transition_seconds=1,
         )
 
     async def test_stable_foreign_fabric_write_creates_hold(self):

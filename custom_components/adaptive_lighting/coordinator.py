@@ -29,6 +29,7 @@ RGB_LIKE_MODES = {"hs", "rgb", "rgbw", "rgbww", "xy"}
 MANUAL_HOLD_SECONDS = 2 * 60 * 60
 AUTOMATION_GRACE_SECONDS = 5
 TURN_OFF_GUARD_SECONDS = 5
+TURN_ON_TRANSITION_SECONDS = 1
 MIN_SPLIT_COMMAND_DELAY_SECONDS = 0.25
 AUTOMATION_CONTEXT_PREFIX = "adl:"
 LIGHT_DOMAIN = "light"
@@ -86,7 +87,7 @@ class Settings:
     
     @property
     def transition(self) -> int:
-        return 1 # seconds
+        return 10 # seconds
     
     @property
     def sleep_b(self) -> int:
@@ -292,12 +293,21 @@ class AdaptiveController:
         async with self._apply_semaphore:
             await self._apply_light_settings(ent_id, mode, brightness, k)
 
-    async def _apply_light_settings(self, ent_id: str, mode: str, brightness: int, k: int) -> None:
+    async def _apply_light_settings(
+        self,
+        ent_id: str,
+        mode: str,
+        brightness: int,
+        k: int,
+        *,
+        transition_seconds: int | None = None,
+    ) -> None:
         """Apply brightness and color settings to a specific light entity."""
         if not self._enabled:
             return
 
-        transition_seconds = self._safe_transition_seconds()
+        if transition_seconds is None:
+            transition_seconds = self._safe_transition_seconds()
 
         # Check if cancelled before starting
         if ent_id in self._cancelled_entities:
@@ -698,7 +708,7 @@ class AdaptiveController:
                         mode,
                         brightness,
                         self._clamp_color_temperature(state, kelvin),
-                        self._safe_transition_seconds(),
+                        TURN_ON_TRANSITION_SECONDS,
                         native_target,
                         allow_during_turn_off_guard=True,
                     ),
@@ -715,7 +725,16 @@ class AdaptiveController:
         self._cancel_pending_task(entity_id)
 
         b_pct, k = self._compute_targets()
-        self._track_entity_task(entity_id, self._apply_light_settings(entity_id, mode, b_pct, k))
+        self._track_entity_task(
+            entity_id,
+            self._apply_light_settings(
+                entity_id,
+                mode,
+                b_pct,
+                k,
+                transition_seconds=TURN_ON_TRANSITION_SECONDS,
+            ),
+        )
 
     async def _confirm_guarded_turn_on(self, entity_id: str, mode: str) -> None:
         """Apply settings after an ambiguous state-only turn-on stays on."""
@@ -742,6 +761,7 @@ class AdaptiveController:
             mode,
             brightness,
             kelvin,
+            transition_seconds=TURN_ON_TRANSITION_SECONDS,
         )
 
     def _handle_manual_adjustment(self, entity_id: str, old_state, new_state) -> None:

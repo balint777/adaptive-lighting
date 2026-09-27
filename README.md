@@ -12,7 +12,7 @@ Adaptive Lighting is a Home Assistant custom component that intelligently contro
 ### 🌅 **Automatic Sun-Based Adjustments**
 - **Brightness**: Automatically adjusts from 1% to 100% based on sun elevation
 - **Color Temperature**: Transitions from warm 2200K to cool 6500K throughout the day
-- **Smooth Transitions**: Gradual changes every 2 minutes with smooth 1-second transitions
+- **Smooth Transitions**: Gradual changes every 2 minutes with smooth 10-second transitions
 - **Power-Safe Updates**: Brightness and color are sent sequentially for broad bulb compatibility, while a turn-off request immediately cancels the pending sequence
 - **Native Matter and ZHA Control**: Uses power-neutral protocol commands and fails closed if that native path is temporarily unavailable
 
@@ -141,7 +141,7 @@ Adaptive Lighting works alongside your existing automations:
 
 ### Update Frequency
 - **Periodic Updates**: Every 2 minutes
-- **Transition Duration**: 1 second per change
+- **Transition Duration**: 10 seconds for periodic changes; 1 second after turn-on
 - **Command Ordering**: Brightness completes before color temperature is sent
 - **Turn-On Response**: Immediate
 
@@ -223,6 +223,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ### Version 1.3.5
 - Allow the color-temperature phase of a native fast turn-on to finish through the guard
+
+### Version 1.3.6
+- Use smooth 10-second transitions for regular updates while keeping turn-on correction at 1 second
 
 ---
 
