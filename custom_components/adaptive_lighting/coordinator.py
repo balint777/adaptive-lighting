@@ -666,16 +666,39 @@ class AdaptiveController:
     def _handle_turn_on(self, entity_id: str, mode: str) -> None:
         """Handle entity turn-on transitions."""
         # A device or integration may briefly report "on" while a turn-off is
-        # still settling. For state-only turn-ons (for example, a command from
-        # another Matter fabric), wait out the guard and confirm that the light
-        # remains on instead of discarding the event. Tracking the confirmation
-        # as a pending task also prevents startup attribute reports from being
-        # mistaken for a new manual adjustment. An explicit later turn_on
-        # request bypasses this guard immediately.
+        # still settling. Native Matter/ZHA commands are safe to send
+        # immediately because ExecuteIfOff=false prevents a stale report from
+        # powering the light back on. Generic service targets still wait out the
+        # guard and confirm that the light remains on.
         self._clear_manual_hold(entity_id)
         self._native_expected_states.pop(entity_id, None)
         self._cancel_native_reconciliation(entity_id)
         if self._is_guarded_after_turn_off(entity_id):
+            native_resolution = self._native_lights.resolve(entity_id, mode=mode)
+            native_target = native_resolution.target
+            if (
+                native_resolution.status is NativeResolutionStatus.TARGET
+                and native_target is not None
+            ):
+                state = self.hass.states.get(entity_id)
+                if state is None or not self._is_state_on(state):
+                    return
+                self._cancelled_entities.discard(entity_id)
+                self._cancel_pending_task(entity_id)
+                brightness, kelvin = self._compute_targets()
+                self._track_entity_task(
+                    entity_id,
+                    self._apply_native_light_settings(
+                        entity_id,
+                        mode,
+                        brightness,
+                        self._clamp_color_temperature(state, kelvin),
+                        self._safe_transition_seconds(),
+                        native_target,
+                    ),
+                )
+                return
+
             self._track_entity_task(
                 entity_id,
                 self._confirm_guarded_turn_on(entity_id, mode),

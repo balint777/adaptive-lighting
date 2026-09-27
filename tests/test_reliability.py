@@ -321,6 +321,53 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         handle_turn_on.assert_called_once_with("light.bulb", "ct")
 
+    async def test_guarded_native_turn_on_bypasses_confirmation_delay(self):
+        light = self._light()
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        controller._last_turn_off_request["light.bulb"] = time.monotonic()
+        controller._cancelled_entities.add("light.bulb")
+        target = Mock(integration="matter")
+        controller._native_lights.resolve = Mock(
+            return_value=native.NativeResolution(
+                native.NativeResolutionStatus.TARGET,
+                target=target,
+                integration="matter",
+            )
+        )
+        controller._compute_targets = Mock(return_value=(1, 2200))
+        controller._apply_native_light_settings = AsyncMock()
+
+        controller._handle_turn_on("light.bulb", "ct")
+        await asyncio.sleep(0)
+
+        controller._apply_native_light_settings.assert_awaited_once_with(
+            "light.bulb",
+            "ct",
+            1,
+            2200,
+            1,
+            target,
+        )
+        self.assertNotIn("light.bulb", controller._cancelled_entities)
+
+    async def test_guarded_generic_turn_on_keeps_confirmation_delay(self):
+        light = self._light()
+        controller = coordinator.AdaptiveController(FakeHass(light), coordinator.Settings())
+        controller._last_turn_off_request["light.bulb"] = time.monotonic()
+        controller._native_lights.resolve = Mock(
+            return_value=native.NativeResolution(
+                native.NativeResolutionStatus.NOT_NATIVE
+            )
+        )
+        controller._confirm_guarded_turn_on = AsyncMock()
+
+        controller._handle_turn_on("light.bulb", "ct")
+        await asyncio.sleep(0)
+
+        controller._confirm_guarded_turn_on.assert_awaited_once_with(
+            "light.bulb", "ct"
+        )
+
     async def test_stable_foreign_fabric_write_creates_hold(self):
         light = self._light(brightness=3, kelvin=2200)
         hass = FakeHass(light)

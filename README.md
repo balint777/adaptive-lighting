@@ -160,12 +160,13 @@ bulb firmware which can otherwise become unresponsive until power-cycled.
 
 Turn-on commands issued by another Matter fabric are visible to Home Assistant only
 through the resulting state reports. If such a report arrives during the short
-turn-off race guard, the integration waits for the guard to expire and then adapts the
-light if it is still on. Native brightness/color reports are matched to a command
-generation and reconciled after they settle. Intermediate transition reports do not
-start a hold, while a stable divergent Apple Home setting does. Availability recovery
-(`unavailable`/`unknown` to `on`) is not treated as a power cycle and therefore cannot
-silently release an existing hold.
+turn-off race guard, a resolved native target is adapted immediately: its
+`ExecuteIfOff=false` commands are safe even if the `on` report is stale. Only generic
+service targets retain the five-second confirmation. Native brightness/color reports
+are matched to a command generation and reconciled after they settle. Intermediate
+transition reports do not start a hold, while a stable divergent Apple Home setting
+does. Availability recovery (`unavailable`/`unknown` to `on`) is not treated as a power
+cycle and therefore cannot silently release an existing hold.
 
 For Zigbee2MQTT, Philips Hue, Z-Wave, Wi-Fi, and other non-native integrations, the
 integration retains the generic `light.turn_on` path. That fallback cancels adaptation
@@ -215,6 +216,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Preserve manual holds across availability recovery and Home Assistant restarts
 - Reconcile stable foreign-fabric changes against native command generations
 - Restore the integration enable switch after restart and enforce one global instance
+
+### Version 1.3.4
+- Apply native Matter/ZHA settings immediately after a cross-fabric off/on cycle
+- Retain the five-second safety confirmation for generic service fallbacks
 
 ---
 
